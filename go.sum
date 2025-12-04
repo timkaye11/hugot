@@ -29,12 +29,8 @@ github.com/gomlx/exceptions v0.0.3 h1:HKnTgEjj4jlmhr8zVFkTP9qmV1ey7ypYYosQ8GzXWu
 github.com/gomlx/exceptions v0.0.3/go.mod h1:uHL0TQwJ0xaV2/snJOJV6hSE4yRmhhfymuYgNredGxU=
 github.com/gomlx/go-huggingface v0.3.1 h1:kMXA0ecTKywh4xo3WpklCDqUPmyg4ihsyftgCZNYGaA=
 github.com/gomlx/go-huggingface v0.3.1/go.mod h1:j1cd4gD0A2pwdYHZfkPMYfYr1C+KHCc2YA1kTEBWlTo=
-github.com/gomlx/gomlx v0.24.1 h1:52Gdjk9hgfrA2Oah5roa7pmmD7WEm4D8UfHaXcg8ZhY=
-github.com/gomlx/gomlx v0.24.1/go.mod h1:IFuL3ILLfJgY6XHkgwQtV6R0Nn61+tt7MV84xkzFj9A=
 github.com/gomlx/gopjrt v0.9.1 h1:R+grf72WYfPk53jLl5oLxqZU2DsE3kA8OIH6tICYC34=
 github.com/gomlx/gopjrt v0.9.1/go.mod h1:c8UENVGnxIDdihEL5HinlAdgR7RxTbEPLBppiMQF1ew=
-github.com/gomlx/onnx-gomlx v0.3.2 h1:GzYvrCqAuxAID7OEPlDwqqkYMKUyEbDTX37Qc8v17M0=
-github.com/gomlx/onnx-gomlx v0.3.2/go.mod h1:wqD8V9UgefKA7gjLT2YTXPs1m+THV4phS/bh71VnfrM=
 github.com/gomlx/stablehlo v0.1.0 h1:vcjBWL29mLpwOTNkktXve7N2H3ORdSv/KZC0j7hyjK4=
 github.com/gomlx/stablehlo v0.1.0/go.mod h1:xBBM/uNpu9SAzZW1rtMvKI832wwZ2DPJVHOsbwTNfgE=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
@@ -81,6 +77,10 @@ github.com/sugarme/regexpset v0.0.0-20200920021344-4d4ec8eaf93c h1:pwb4kNSHb4K89
 github.com/sugarme/regexpset v0.0.0-20200920021344-4d4ec8eaf93c/go.mod h1:2gwkXLWbDGUQWeL3RtpCmcY4mzCtU13kb9UsAg9xMaw=
 github.com/sugarme/tokenizer v0.3.0 h1:FE8DYbNSz/kSbgEo9l/RjgYHkIJYEdskumitFQBE9FE=
 github.com/sugarme/tokenizer v0.3.0/go.mod h1:VJ+DLK5ZEZwzvODOWwY0cw+B1dabTd3nCB5HuFCItCc=
+github.com/timkaye11/gomlx v0.0.0-20251203001453-fb44098d61ca h1:gpZq4LoAPCVlasCZ0qupkyWJyqa2mrFhDPc5EL6KIYg=
+github.com/timkaye11/gomlx v0.0.0-20251203001453-fb44098d61ca/go.mod h1:odsyqRqTKnGhTlsZVQb+zlZHtxMJFwFyClhmR+u8PfM=
+github.com/timkaye11/onnx-gomlx v0.0.0-20251203001838-769159b6c736 h1:IGOqtf7Smw+Z5cov9iPV7Ihf7nFo5R9sJK5q9WqXUZ8=
+github.com/timkaye11/onnx-gomlx v0.0.0-20251203001838-769159b6c736/go.mod h1:wqD8V9UgefKA7gjLT2YTXPs1m+THV4phS/bh71VnfrM=
 github.com/urfave/cli/v3 v3.6.1 h1:j8Qq8NyUawj/7rTYdBGrxcH7A/j7/G8Q5LhWEW4G3Mo=
 github.com/urfave/cli/v3 v3.6.1/go.mod h1:ysVLtOEmg2tOy6PknnYVhDoouyC/6N42TMeoMzskhso=
 github.com/viant/afs v1.28.0 h1:1wdVltPIupG66/v5mcr9KzKi3WtXPgcL3VMy5qp7ZUI=

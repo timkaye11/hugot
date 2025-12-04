@@ -19,6 +19,7 @@ type Session struct {
 	crossEncoderPipelines           pipelineMap[*pipelines.CrossEncoderPipeline]
 	imageClassificationPipelines    pipelineMap[*pipelines.ImageClassificationPipeline]
 	textGenerationPipelines         pipelineMap[*pipelines.TextGenerationPipeline]
+	glinerPipelines                 pipelineMap[*pipelines.GLiNERPipeline]
 	models                          map[string]*pipelineBackends.Model
 	options                         *options.Options
 	environmentDestroy              func() error
@@ -46,6 +47,7 @@ func newSession(backend string, opts ...options.WithOption) (*Session, error) {
 		crossEncoderPipelines:           map[string]*pipelines.CrossEncoderPipeline{},
 		imageClassificationPipelines:    map[string]*pipelines.ImageClassificationPipeline{},
 		textGenerationPipelines:         map[string]*pipelines.TextGenerationPipeline{},
+		glinerPipelines:                 map[string]*pipelines.GLiNERPipeline{},
 		models:                          map[string]*pipelineBackends.Model{},
 		options:                         parsedOptions,
 		environmentDestroy: func() error {
@@ -108,6 +110,12 @@ type TextGenerationConfig = pipelineBackends.PipelineConfig[*pipelines.TextGener
 // TextGenerationOption is an option for a text generation pipeline
 type TextGenerationOption = pipelineBackends.PipelineOption[*pipelines.TextGenerationPipeline]
 
+// GLiNERConfig is the configuration for a GLiNER (zero-shot NER) pipeline
+type GLiNERConfig = pipelineBackends.PipelineConfig[*pipelines.GLiNERPipeline]
+
+// GLiNEROption is an option for a GLiNER pipeline
+type GLiNEROption = pipelineBackends.PipelineOption[*pipelines.GLiNERPipeline]
+
 // NewPipeline can be used to create a new pipeline of type T. The initialised pipeline will be returned and it
 // will also be stored in the session object so that all created pipelines can be destroyed with session.Destroy()
 // at once.
@@ -159,6 +167,8 @@ func NewPipeline[T pipelineBackends.Pipeline](s *Session, pipelineConfig pipelin
 		s.imageClassificationPipelines[name] = typedPipeline
 	case *pipelines.TextGenerationPipeline:
 		s.textGenerationPipelines[name] = typedPipeline
+	case *pipelines.GLiNERPipeline:
+		s.glinerPipelines[name] = typedPipeline
 	default:
 		return pipeline, fmt.Errorf("pipeline type not supported: %T", typedPipeline)
 	}
@@ -226,6 +236,14 @@ func InitializePipeline[T pipelineBackends.Pipeline](p T, pipelineConfig pipelin
 		}
 		pipeline = any(pipelineInitialised).(T)
 		name = config.Name
+	case *pipelines.GLiNERPipeline:
+		config := any(pipelineConfig).(pipelineBackends.PipelineConfig[*pipelines.GLiNERPipeline])
+		pipelineInitialised, err := pipelines.NewGLiNERPipeline(config, options, model)
+		if err != nil {
+			return pipeline, name, err
+		}
+		pipeline = any(pipelineInitialised).(T)
+		name = config.Name
 	default:
 		return pipeline, name, fmt.Errorf("not implemented")
 	}
@@ -276,6 +294,12 @@ func GetPipeline[T pipelineBackends.Pipeline](s *Session, name string) (T, error
 		return any(p).(T), nil
 	case *pipelines.TextGenerationPipeline:
 		p, ok := s.textGenerationPipelines[name]
+		if !ok {
+			return pipeline, &pipelineNotFoundError{pipelineName: name}
+		}
+		return any(p).(T), nil
+	case *pipelines.GLiNERPipeline:
+		p, ok := s.glinerPipelines[name]
 		if !ok {
 			return pipeline, &pipelineNotFoundError{pipelineName: name}
 		}
@@ -365,6 +389,17 @@ func ClosePipeline[T pipelineBackends.Pipeline](s *Session, name string) error {
 				return model.Destroy()
 			}
 		}
+	case *pipelines.GLiNERPipeline:
+		p, ok := s.glinerPipelines[name]
+		if ok {
+			model := p.Model
+			delete(s.glinerPipelines, name)
+			delete(model.Pipelines, name)
+			if len(model.Pipelines) == 0 {
+				delete(s.models, model.Path)
+				return model.Destroy()
+			}
+		}
 	default:
 		return errors.New("pipeline type not supported")
 	}
@@ -394,6 +429,7 @@ func (s *Session) GetStats() []string {
 		s.zeroShotClassificationPipelines.GetStats(),
 		s.crossEncoderPipelines.GetStats(),
 		s.textGenerationPipelines.GetStats(),
+		s.glinerPipelines.GetStats(),
 	)
 }
 
@@ -411,6 +447,7 @@ func (s *Session) Destroy() error {
 	s.zeroShotClassificationPipelines = nil
 	s.textGenerationPipelines = nil
 	s.crossEncoderPipelines = nil
+	s.glinerPipelines = nil
 
 	if s.options != nil {
 		err = errors.Join(err, s.options.Destroy())
