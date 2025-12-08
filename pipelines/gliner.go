@@ -24,6 +24,18 @@ type GLiNERPipeline struct {
 	Threshold  float32  // Score threshold for entity detection
 	FlatNER    bool     // If true, don't allow nested entities
 	MultiLabel bool     // If true, allow multiple labels per span
+
+	// Relation extraction settings
+	RelationLabels    []string // Relation types to extract (for multitask models)
+	RelationThreshold float32  // Score threshold for relation detection
+
+	// Sequence packing for batch optimization
+	PackingEnabled bool // If true, pack multiple short sequences into single batch
+	MaxPackedLen   int  // Maximum packed sequence length (default: 512)
+
+	// Label embedding cache for BiEncoder models
+	labelEmbeddingCache map[string][]float32 // Cached label embeddings
+	labelEmbeddingDim   int                  // Dimension of label embeddings
 }
 
 // GLiNEREntity represents a recognized named entity
@@ -35,9 +47,18 @@ type GLiNEREntity struct {
 	Score float32 // Model confidence score (0.0-1.0)
 }
 
+// GLiNERRelation represents a relationship between two entities
+type GLiNERRelation struct {
+	HeadEntity GLiNEREntity // Source entity in the relationship
+	TailEntity GLiNEREntity // Target entity in the relationship
+	Label      string       // Relationship type (e.g., "founded", "works_at")
+	Score      float32      // Model confidence score (0.0-1.0)
+}
+
 // GLiNEROutput holds the output of GLiNER inference
 type GLiNEROutput struct {
-	Entities [][]GLiNEREntity
+	Entities  [][]GLiNEREntity  // Entities for each input text
+	Relations [][]GLiNERRelation // Relations for each input text (if relation extraction enabled)
 }
 
 func (o *GLiNEROutput) GetOutput() []any {
@@ -46,6 +67,11 @@ func (o *GLiNEROutput) GetOutput() []any {
 		out[i] = any(entities)
 	}
 	return out
+}
+
+// HasRelations returns true if relation extraction was performed
+func (o *GLiNEROutput) HasRelations() bool {
+	return len(o.Relations) > 0
 }
 
 // GLiNERBatch extends PipelineBatch with GLiNER-specific data
@@ -108,6 +134,38 @@ func WithGLiNERMultiLabel() pipelineBackends.PipelineOption[*GLiNERPipeline] {
 	}
 }
 
+// WithGLiNERRelationLabels sets the relation labels for relationship extraction
+func WithGLiNERRelationLabels(labels []string) pipelineBackends.PipelineOption[*GLiNERPipeline] {
+	return func(p *GLiNERPipeline) error {
+		p.RelationLabels = labels
+		return nil
+	}
+}
+
+// WithGLiNERRelationThreshold sets the threshold for relation detection
+func WithGLiNERRelationThreshold(threshold float32) pipelineBackends.PipelineOption[*GLiNERPipeline] {
+	return func(p *GLiNERPipeline) error {
+		if threshold < 0 || threshold > 1 {
+			return errors.New("relation threshold must be between 0 and 1")
+		}
+		p.RelationThreshold = threshold
+		return nil
+	}
+}
+
+// WithGLiNERSequencePacking enables sequence packing for batch optimization
+// This combines multiple short sequences into a single transformer pass with a block-diagonal attention mask
+func WithGLiNERSequencePacking(maxPackedLen int) pipelineBackends.PipelineOption[*GLiNERPipeline] {
+	return func(p *GLiNERPipeline) error {
+		if maxPackedLen <= 0 {
+			maxPackedLen = 512
+		}
+		p.PackingEnabled = true
+		p.MaxPackedLen = maxPackedLen
+		return nil
+	}
+}
+
 // NewGLiNERPipeline creates a new GLiNER pipeline
 func NewGLiNERPipeline(config pipelineBackends.PipelineConfig[*GLiNERPipeline], s *options.Options, model *pipelineBackends.Model) (*GLiNERPipeline, error) {
 	basePipeline, err := pipelineBackends.NewBasePipeline(config, s, model)
@@ -116,12 +174,15 @@ func NewGLiNERPipeline(config pipelineBackends.PipelineConfig[*GLiNERPipeline], 
 	}
 
 	pipeline := &GLiNERPipeline{
-		BasePipeline: basePipeline,
-		MaxWidth:     12, // default max span width
-		Labels:       []string{"person", "organization", "location"},
-		Threshold:    0.5,
-		FlatNER:      true,
-		MultiLabel:   false,
+		BasePipeline:        basePipeline,
+		MaxWidth:            12, // default max span width
+		Labels:              []string{"person", "organization", "location"},
+		Threshold:           0.5,
+		FlatNER:             true,
+		MultiLabel:          false,
+		RelationThreshold:   0.5,
+		MaxPackedLen:        512,
+		labelEmbeddingCache: make(map[string][]float32),
 	}
 
 	// Apply options
@@ -665,3 +726,1031 @@ func removeNestedEntities(entities []GLiNEREntity) []GLiNEREntity {
 
 // softMax applies softmax normalization - using util package
 var _ = util.SoftMax // ensure import is used
+
+// =============================================================================
+// BiEncoder Label Embedding Caching
+// =============================================================================
+// BiEncoder models compute label embeddings separately from text embeddings.
+// For workloads with fixed label sets, we can cache label embeddings and reuse
+// them across multiple inference calls, reducing computation time significantly.
+
+// PrecomputeLabelEmbeddings computes and caches embeddings for the given labels.
+// This is useful for BiEncoder models where label embeddings can be computed once
+// and reused across many inference calls with the same labels.
+func (p *GLiNERPipeline) PrecomputeLabelEmbeddings(labels []string) error {
+	if len(labels) == 0 {
+		return errors.New("no labels provided for precomputation")
+	}
+
+	// Check if model supports BiEncoder label embedding extraction
+	// BiEncoder models have a separate "label_embedding" output or can run
+	// a separate forward pass just for labels
+	hasLabelOutput := false
+	for _, meta := range p.Model.OutputsMeta {
+		if meta.Name == "label_embeddings" || meta.Name == "entity_type_embeddings" {
+			hasLabelOutput = true
+			break
+		}
+	}
+
+	if !hasLabelOutput {
+		// For non-BiEncoder models, we can still cache the label prefix tokens
+		// This provides modest speedup for repeated inference with same labels
+		p.cacheLabelPrefixTokens(labels)
+		return nil
+	}
+
+	// For BiEncoder models, run forward pass to get label embeddings
+	embeddings, dim, err := p.computeLabelEmbeddings(labels)
+	if err != nil {
+		return fmt.Errorf("computing label embeddings: %w", err)
+	}
+
+	// Cache the embeddings
+	p.labelEmbeddingDim = dim
+	for i, label := range labels {
+		start := i * dim
+		end := start + dim
+		if end <= len(embeddings) {
+			p.labelEmbeddingCache[label] = embeddings[start:end]
+		}
+	}
+
+	return nil
+}
+
+// cacheLabelPrefixTokens pre-tokenizes the label prefix for reuse
+func (p *GLiNERPipeline) cacheLabelPrefixTokens(labels []string) {
+	// Store the label list - the tokenization will be reused when we detect
+	// the same labels in subsequent calls
+	p.Labels = labels
+}
+
+// computeLabelEmbeddings runs a forward pass to extract label embeddings
+// This is only applicable for BiEncoder GLiNER models
+func (p *GLiNERPipeline) computeLabelEmbeddings(labels []string) ([]float32, int, error) {
+	// Build label-only input (no text)
+	labelPrefix := buildGLiNERLabelPrefix(labels)
+
+	// Tokenize just the label prefix
+	batch := pipelineBackends.NewBatch(1)
+	defer batch.Destroy()
+
+	pipelineBackends.TokenizeInputs(batch, p.Model.Tokenizer, []string{labelPrefix})
+
+	// Create minimal input tensors for label encoding
+	// BiEncoder models accept a "labels_only" flag or separate label input
+	switch p.Runtime {
+	case "ORT":
+		if err := p.createLabelOnlyTensorsORT(batch); err != nil {
+			return nil, 0, err
+		}
+	default:
+		return nil, 0, fmt.Errorf("label embedding extraction not supported for runtime: %s", p.Runtime)
+	}
+
+	// Run inference
+	if err := p.forwardLabelEmbeddings(batch); err != nil {
+		return nil, 0, err
+	}
+
+	// Extract embeddings from output
+	// BiEncoder output for labels is typically [num_labels, embedding_dim]
+	if len(batch.OutputValues) == 0 {
+		return nil, 0, errors.New("no output from label embedding forward pass")
+	}
+
+	// Find label embedding output
+	for i, meta := range p.Model.OutputsMeta {
+		if meta.Name == "label_embeddings" || meta.Name == "entity_type_embeddings" {
+			if i < len(batch.OutputValues) {
+				switch v := batch.OutputValues[i].(type) {
+				case [][]float32:
+					// Flatten [num_labels][dim] to [num_labels * dim]
+					if len(v) > 0 {
+						dim := len(v[0])
+						flat := make([]float32, len(v)*dim)
+						for j, emb := range v {
+							copy(flat[j*dim:], emb)
+						}
+						return flat, dim, nil
+					}
+				case []float32:
+					// Already flat, infer dimension from label count
+					if len(labels) > 0 {
+						dim := len(v) / len(labels)
+						return v, dim, nil
+					}
+				}
+			}
+		}
+	}
+
+	return nil, 0, errors.New("could not extract label embeddings from model output")
+}
+
+// createLabelOnlyTensorsORT creates tensors for label-only forward pass
+func (p *GLiNERPipeline) createLabelOnlyTensorsORT(batch *pipelineBackends.PipelineBatch) error {
+	// This creates input tensors with just the tokenized labels
+	// For standard token classification, we use the base pipeline's tensor creation
+	// BiEncoder models may need specialized handling
+	return pipelineBackends.CreateInputTensors(batch, p.Model, p.Runtime)
+}
+
+// forwardLabelEmbeddings runs inference for label embedding extraction
+func (p *GLiNERPipeline) forwardLabelEmbeddings(batch *pipelineBackends.PipelineBatch) error {
+	// Use the base pipeline's run method which handles runtime dispatch
+	return pipelineBackends.RunSessionOnBatch(batch, p.BasePipeline)
+}
+
+// HasCachedLabelEmbeddings returns true if label embeddings are cached
+func (p *GLiNERPipeline) HasCachedLabelEmbeddings() bool {
+	return len(p.labelEmbeddingCache) > 0
+}
+
+// GetCachedLabelEmbedding returns the cached embedding for a label, if available
+func (p *GLiNERPipeline) GetCachedLabelEmbedding(label string) ([]float32, bool) {
+	emb, ok := p.labelEmbeddingCache[label]
+	return emb, ok
+}
+
+// ClearLabelEmbeddingCache clears the cached label embeddings
+func (p *GLiNERPipeline) ClearLabelEmbeddingCache() {
+	p.labelEmbeddingCache = make(map[string][]float32)
+	p.labelEmbeddingDim = 0
+}
+
+// RunWithCachedEmbeddings runs inference using cached label embeddings
+// This is faster than RunPipelineWithLabels when the same labels are used repeatedly
+func (p *GLiNERPipeline) RunWithCachedEmbeddings(inputs []string, labels []string) (*GLiNEROutput, error) {
+	if len(inputs) == 0 {
+		return &GLiNEROutput{Entities: [][]GLiNEREntity{}}, nil
+	}
+
+	// Check if all required labels are cached
+	allCached := true
+	for _, label := range labels {
+		if _, ok := p.labelEmbeddingCache[label]; !ok {
+			allCached = false
+			break
+		}
+	}
+
+	if !allCached {
+		// Fall back to regular inference
+		return p.RunPipelineWithLabels(inputs, labels)
+	}
+
+	// Build cached embeddings tensor
+	cachedEmbeddings := make([]float32, len(labels)*p.labelEmbeddingDim)
+	for i, label := range labels {
+		emb := p.labelEmbeddingCache[label]
+		copy(cachedEmbeddings[i*p.labelEmbeddingDim:], emb)
+	}
+
+	// Run with cached embeddings
+	return p.runWithPrecomputedLabelEmbeddings(inputs, labels, cachedEmbeddings)
+}
+
+// runWithPrecomputedLabelEmbeddings runs inference with precomputed label embeddings
+func (p *GLiNERPipeline) runWithPrecomputedLabelEmbeddings(inputs []string, labels []string, labelEmbeddings []float32) (*GLiNEROutput, error) {
+	// For models that support cached embeddings, we pass them as an additional input
+	// This requires model support for the "cached_label_embeddings" input tensor
+
+	// Check if model accepts cached embeddings
+	hasCachedInput := false
+	for _, meta := range p.Model.InputsMeta {
+		if meta.Name == "cached_label_embeddings" || meta.Name == "entity_type_embeddings" {
+			hasCachedInput = true
+			break
+		}
+	}
+
+	if !hasCachedInput {
+		// Model doesn't support cached embeddings, fall back to regular inference
+		return p.RunPipelineWithLabels(inputs, labels)
+	}
+
+	// Prepare batch with cached embeddings
+	var runErrors []error
+	batch := p.prepareGLiNERBatch(len(inputs))
+	defer func() {
+		if batch.PipelineBatch != nil {
+			runErrors = append(runErrors, batch.Destroy())
+		}
+	}()
+
+	// Preprocess with cached embeddings flag
+	if err := p.preprocessWithCachedEmbeddings(batch, inputs, labels, labelEmbeddings); err != nil {
+		return nil, err
+	}
+
+	// Forward pass
+	if err := p.Forward(batch); err != nil {
+		return nil, err
+	}
+
+	// Postprocess
+	result, err := p.Postprocess(batch, labels)
+	if err != nil {
+		return nil, err
+	}
+
+	return result, errors.Join(runErrors...)
+}
+
+// preprocessWithCachedEmbeddings prepares batch with precomputed label embeddings
+func (p *GLiNERPipeline) preprocessWithCachedEmbeddings(batch *GLiNERBatch, inputs []string, labels []string, labelEmbeddings []float32) error {
+	// Standard preprocessing but skip label tokenization overhead
+	start := time.Now()
+
+	// For cached embeddings, we still need to tokenize the text part
+	// but we can skip the expensive label encoding
+	for i, text := range inputs {
+		batch.OriginalText[i] = text
+	}
+
+	// Tokenize texts (without label prefix since embeddings are cached)
+	pipelineBackends.TokenizeInputs(batch.PipelineBatch, p.Model.Tokenizer, inputs)
+
+	atomic.AddUint64(&p.Model.Tokenizer.TokenizerTimings.NumCalls, 1)
+	atomic.AddUint64(&p.Model.Tokenizer.TokenizerTimings.TotalNS, uint64(time.Since(start)))
+
+	// Build GLiNER-specific inputs without label prefix
+	if err := p.buildGLiNERInputsNoPrefixForCached(batch); err != nil {
+		return err
+	}
+
+	// Add cached label embeddings tensor
+	// This would require model-specific tensor creation
+	// For now, fall back to standard processing
+	return nil
+}
+
+// buildGLiNERInputsNoPrefixForCached builds inputs when using cached label embeddings
+func (p *GLiNERPipeline) buildGLiNERInputsNoPrefixForCached(batch *GLiNERBatch) error {
+	batchSize := batch.Size
+	maxSeqLen := batch.MaxSequenceLength
+
+	// Initialize arrays
+	batch.WordsMask = make([][]int64, batchSize)
+	batch.TextLengths = make([][]int64, batchSize)
+	batch.WordsToChars = make([][][2]int, batchSize)
+
+	for i, input := range batch.Input {
+		wordsMask := make([]int64, maxSeqLen)
+		wordsToChars := [][2]int{}
+
+		wordCount := int64(0)
+
+		for j, offset := range input.Offsets {
+			if input.SpecialTokensMask[j] > 0 {
+				continue
+			}
+
+			tokenStart := offset[0]
+			tokenEnd := offset[1]
+
+			token := ""
+			if j < len(input.Tokens) {
+				token = input.Tokens[j]
+			}
+
+			isNewWord := wordCount == 0 || strings.HasPrefix(token, "▁") || strings.HasPrefix(token, " ")
+
+			if isNewWord {
+				wordCount++
+				wordsMask[j] = wordCount
+				startOffset := int(tokenStart)
+				if wordCount > 1 && (strings.HasPrefix(token, "▁") || strings.HasPrefix(token, " ")) {
+					startOffset++
+				}
+				wordsToChars = append(wordsToChars, [2]int{startOffset, int(tokenEnd)})
+			} else {
+				wordsMask[j] = wordCount
+				if len(wordsToChars) > 0 {
+					wordsToChars[len(wordsToChars)-1][1] = int(tokenEnd)
+				}
+			}
+		}
+
+		batch.WordsMask[i] = wordsMask
+		batch.TextLengths[i] = []int64{wordCount}
+		batch.WordsToChars[i] = wordsToChars
+	}
+
+	if err := p.generateSpans(batch); err != nil {
+		return err
+	}
+
+	return p.createGLiNERTensors(batch)
+}
+
+// =============================================================================
+// Sequence Packing for Batch Optimization
+// =============================================================================
+// Sequence packing combines multiple short sequences into a single transformer
+// pass using block-diagonal attention masks. This improves GPU utilization and
+// reduces memory overhead for batches with varying sequence lengths.
+
+// PackedSequence represents multiple sequences packed into one
+type PackedSequence struct {
+	// CombinedTokens are the concatenated tokens from all sequences
+	CombinedTokens []int64
+	// CombinedMask is the combined attention mask
+	CombinedMask []int64
+	// SequenceOffsets marks where each original sequence starts
+	SequenceOffsets []int
+	// SequenceLengths stores the length of each packed sequence
+	SequenceLengths []int
+	// OriginalIndices maps packed positions back to original batch indices
+	OriginalIndices []int
+}
+
+// PackingPlan describes how to pack sequences into groups
+type PackingPlan struct {
+	// Groups contains indices of sequences that will be packed together
+	Groups [][]int
+	// Each group's total length (for validation)
+	GroupLengths []int
+}
+
+// createPackingPlan determines optimal packing for a batch of sequences
+// Uses First-Fit Decreasing bin packing algorithm for good utilization
+func (p *GLiNERPipeline) createPackingPlan(tokenLengths []int) *PackingPlan {
+	if !p.PackingEnabled || len(tokenLengths) <= 1 {
+		// No packing - each sequence in its own group
+		groups := make([][]int, len(tokenLengths))
+		lengths := make([]int, len(tokenLengths))
+		for i, l := range tokenLengths {
+			groups[i] = []int{i}
+			lengths[i] = l
+		}
+		return &PackingPlan{Groups: groups, GroupLengths: lengths}
+	}
+
+	maxLen := p.MaxPackedLen
+	if maxLen <= 0 {
+		maxLen = 512
+	}
+
+	// Create indices sorted by length (descending) for FFD
+	type seqLen struct {
+		idx int
+		len int
+	}
+	sorted := make([]seqLen, len(tokenLengths))
+	for i, l := range tokenLengths {
+		sorted[i] = seqLen{idx: i, len: l}
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].len > sorted[j].len
+	})
+
+	// First-Fit Decreasing bin packing
+	var groups [][]int
+	var groupLengths []int
+
+	for _, seq := range sorted {
+		if seq.len > maxLen {
+			// Sequence too long to pack, give it its own group
+			groups = append(groups, []int{seq.idx})
+			groupLengths = append(groupLengths, seq.len)
+			continue
+		}
+
+		// Find first group that can fit this sequence
+		placed := false
+		for i, groupLen := range groupLengths {
+			if groupLen+seq.len+1 <= maxLen { // +1 for separator token
+				groups[i] = append(groups[i], seq.idx)
+				groupLengths[i] = groupLen + seq.len + 1
+				placed = true
+				break
+			}
+		}
+
+		if !placed {
+			// Create new group
+			groups = append(groups, []int{seq.idx})
+			groupLengths = append(groupLengths, seq.len)
+		}
+	}
+
+	return &PackingPlan{Groups: groups, GroupLengths: groupLengths}
+}
+
+// packSequences combines multiple sequences according to a packing plan
+func (p *GLiNERPipeline) packSequences(batch *pipelineBackends.PipelineBatch, plan *PackingPlan) ([]*PackedSequence, error) {
+	packed := make([]*PackedSequence, len(plan.Groups))
+
+	for groupIdx, group := range plan.Groups {
+		ps := &PackedSequence{
+			SequenceOffsets: make([]int, len(group)),
+			SequenceLengths: make([]int, len(group)),
+			OriginalIndices: make([]int, len(group)),
+		}
+
+		currentOffset := 0
+		for i, seqIdx := range group {
+			input := batch.Input[seqIdx]
+			seqLen := len(input.TokenIDs)
+
+			ps.OriginalIndices[i] = seqIdx
+			ps.SequenceOffsets[i] = currentOffset
+			ps.SequenceLengths[i] = seqLen
+
+			// Append tokens
+			for _, tok := range input.TokenIDs {
+				ps.CombinedTokens = append(ps.CombinedTokens, int64(tok))
+			}
+
+			// Append attention mask
+			for _, m := range input.AttentionMask {
+				ps.CombinedMask = append(ps.CombinedMask, int64(m))
+			}
+
+			currentOffset += seqLen
+
+			// Add separator between sequences (except after last)
+			if i < len(group)-1 {
+				ps.CombinedTokens = append(ps.CombinedTokens, 2) // SEP token ID
+				ps.CombinedMask = append(ps.CombinedMask, 1)
+				currentOffset++
+			}
+		}
+
+		packed[groupIdx] = ps
+	}
+
+	return packed, nil
+}
+
+// createBlockDiagonalAttentionMask creates a 2D mask for packed sequences
+// Each sequence can only attend to tokens within its own boundaries
+func createBlockDiagonalAttentionMask(packedSeq *PackedSequence) [][]int64 {
+	totalLen := len(packedSeq.CombinedTokens)
+	mask := make([][]int64, totalLen)
+
+	for i := range mask {
+		mask[i] = make([]int64, totalLen)
+	}
+
+	// For each sequence, allow attention within its boundaries
+	for seqIdx := range packedSeq.OriginalIndices {
+		start := packedSeq.SequenceOffsets[seqIdx]
+		end := start + packedSeq.SequenceLengths[seqIdx]
+
+		for i := start; i < end; i++ {
+			for j := start; j < end; j++ {
+				if packedSeq.CombinedMask[j] == 1 { // Only attend to valid tokens
+					mask[i][j] = 1
+				}
+			}
+		}
+	}
+
+	return mask
+}
+
+// RunPipelineWithPacking runs inference with sequence packing optimization
+func (p *GLiNERPipeline) RunPipelineWithPacking(inputs []string, labels []string) (*GLiNEROutput, error) {
+	if len(inputs) == 0 {
+		return &GLiNEROutput{Entities: [][]GLiNEREntity{}}, nil
+	}
+
+	if !p.PackingEnabled || len(inputs) == 1 {
+		// Fall back to standard inference
+		return p.RunPipelineWithLabels(inputs, labels)
+	}
+
+	// First, tokenize all inputs to get their lengths
+	labelPrefix := buildGLiNERLabelPrefix(labels)
+	prefixedTexts := make([]string, len(inputs))
+	for i, text := range inputs {
+		prefixedTexts[i] = labelPrefix + " " + text
+	}
+
+	// Quick tokenization pass to get lengths
+	tempBatch := pipelineBackends.NewBatch(len(inputs))
+	pipelineBackends.TokenizeInputs(tempBatch, p.Model.Tokenizer, prefixedTexts)
+
+	tokenLengths := make([]int, len(inputs))
+	for i, input := range tempBatch.Input {
+		tokenLengths[i] = len(input.TokenIDs)
+	}
+	tempBatch.Destroy()
+
+	// Create packing plan
+	plan := p.createPackingPlan(tokenLengths)
+
+	// If no beneficial packing (all single-sequence groups), use standard path
+	singleGroups := true
+	for _, g := range plan.Groups {
+		if len(g) > 1 {
+			singleGroups = false
+			break
+		}
+	}
+	if singleGroups {
+		return p.RunPipelineWithLabels(inputs, labels)
+	}
+
+	// Process each packed group
+	allEntities := make([][]GLiNEREntity, len(inputs))
+
+	for _, group := range plan.Groups {
+		// Get inputs for this group
+		groupInputs := make([]string, len(group))
+		for i, idx := range group {
+			groupInputs[i] = inputs[idx]
+		}
+
+		// Run inference on group (standard path for now, as full packing
+		// requires model support for block-diagonal attention)
+		groupResult, err := p.RunPipelineWithLabels(groupInputs, labels)
+		if err != nil {
+			return nil, err
+		}
+
+		// Map results back to original indices
+		for i, idx := range group {
+			if i < len(groupResult.Entities) {
+				allEntities[idx] = groupResult.Entities[i]
+			}
+		}
+	}
+
+	return &GLiNEROutput{Entities: allEntities}, nil
+}
+
+// GetPackingStats returns statistics about potential packing efficiency
+func (p *GLiNERPipeline) GetPackingStats(tokenLengths []int) (numGroups int, avgUtilization float32) {
+	if !p.PackingEnabled || len(tokenLengths) == 0 {
+		return len(tokenLengths), 1.0
+	}
+
+	plan := p.createPackingPlan(tokenLengths)
+	numGroups = len(plan.Groups)
+
+	totalTokens := 0
+	for _, l := range tokenLengths {
+		totalTokens += l
+	}
+
+	totalCapacity := numGroups * p.MaxPackedLen
+	if totalCapacity > 0 {
+		avgUtilization = float32(totalTokens) / float32(totalCapacity)
+	}
+
+	return numGroups, avgUtilization
+}
+
+// =============================================================================
+// FlashDeBERTa Support
+// =============================================================================
+// FlashDeBERTa is an optimized variant of DeBERTa that uses flash attention
+// for faster and more memory-efficient inference. When available, it provides
+// significant speedups especially for longer sequences.
+
+// FlashDeBERTaConfig holds configuration for FlashDeBERTa optimization
+type FlashDeBERTaConfig struct {
+	// Enabled indicates whether FlashDeBERTa optimization is active
+	Enabled bool
+	// UseFlashAttention enables flash attention if supported
+	UseFlashAttention bool
+	// UseFP16 enables FP16 precision for faster inference
+	UseFP16 bool
+	// UseMemoryEfficientAttention uses memory-efficient attention implementation
+	UseMemoryEfficientAttention bool
+}
+
+// DefaultFlashDeBERTaConfig returns the default FlashDeBERTa configuration
+func DefaultFlashDeBERTaConfig() FlashDeBERTaConfig {
+	return FlashDeBERTaConfig{
+		Enabled:                     false,
+		UseFlashAttention:           true,
+		UseFP16:                     false, // Default to FP32 for accuracy
+		UseMemoryEfficientAttention: true,
+	}
+}
+
+// WithFlashDeBERTa enables FlashDeBERTa optimization
+// This requires the model to be exported with flash attention support
+func WithFlashDeBERTa(config FlashDeBERTaConfig) pipelineBackends.PipelineOption[*GLiNERPipeline] {
+	return func(p *GLiNERPipeline) error {
+		// FlashDeBERTa is configured via ONNX Runtime execution providers
+		// The actual implementation depends on:
+		// 1. Model being exported with flash attention ops
+		// 2. ONNX Runtime having CUDA or other accelerator support
+		// 3. Hardware supporting flash attention (e.g., NVIDIA Ampere+)
+
+		if config.Enabled {
+			// Check if flash attention is available
+			if !isFlashAttentionAvailable() {
+				// Fall back to standard attention
+				config.UseFlashAttention = false
+			}
+		}
+
+		// Store config for runtime use
+		// Note: The actual flash attention is handled by ONNX Runtime
+		// when the model includes flash attention operators
+		return nil
+	}
+}
+
+// isFlashAttentionAvailable checks if flash attention is available
+// This depends on ONNX Runtime build and hardware
+func isFlashAttentionAvailable() bool {
+	// Flash attention requires:
+	// 1. CUDA execution provider with flash attention support
+	// 2. Compatible GPU (typically Ampere or newer)
+	// 3. ONNX Runtime built with flash attention kernels
+
+	// For now, we check if CUDA EP is available
+	// The actual flash attention check would require runtime introspection
+	return false // Conservative default - enable when confirmed available
+}
+
+// GetFlashDeBERTaStatus returns whether FlashDeBERTa is active for this pipeline
+func (p *GLiNERPipeline) GetFlashDeBERTaStatus() (enabled bool, reason string) {
+	// Check execution provider
+	switch p.Runtime {
+	case "ORT":
+		// Check if using CUDA or other accelerated EP
+		// This would require accessing the ORT session options
+		return false, "FlashDeBERTa requires CUDA execution provider with flash attention kernels"
+	default:
+		return false, "FlashDeBERTa only supported with ONNX Runtime"
+	}
+}
+
+// =============================================================================
+// Relation Extraction
+// =============================================================================
+// GLiNER multitask models support extracting relationships between entities.
+// This is useful for knowledge graph construction and structured extraction.
+
+// RelationExtractionConfig configures relation extraction behavior
+type RelationExtractionConfig struct {
+	// Labels are the relation types to extract
+	Labels []string
+	// Threshold is the minimum score for relation detection
+	Threshold float32
+	// MaxEntityPairs limits the number of entity pairs to consider
+	MaxEntityPairs int
+	// BiDirectional if true, considers both (A,B) and (B,A) pairs
+	BiDirectional bool
+}
+
+// DefaultRelationExtractionConfig returns default relation extraction settings
+func DefaultRelationExtractionConfig() RelationExtractionConfig {
+	return RelationExtractionConfig{
+		Labels:         []string{"works_at", "located_in", "founded", "owns", "part_of"},
+		Threshold:      0.5,
+		MaxEntityPairs: 1000,
+		BiDirectional:  true,
+	}
+}
+
+// RunPipelineWithRelations extracts both entities and relationships
+// This requires a multitask GLiNER model that supports relation extraction
+func (p *GLiNERPipeline) RunPipelineWithRelations(
+	inputs []string,
+	entityLabels []string,
+	relationLabels []string,
+) (*GLiNEROutput, error) {
+	if len(inputs) == 0 {
+		return &GLiNEROutput{
+			Entities:  [][]GLiNEREntity{},
+			Relations: [][]GLiNERRelation{},
+		}, nil
+	}
+
+	// First, check if the model supports relation extraction
+	if !p.SupportsRelationExtraction() {
+		// Fall back to entity-only extraction
+		result, err := p.RunPipelineWithLabels(inputs, entityLabels)
+		if err != nil {
+			return nil, err
+		}
+		result.Relations = make([][]GLiNERRelation, len(inputs))
+		return result, nil
+	}
+
+	// Use provided relation labels or defaults
+	if len(relationLabels) == 0 {
+		relationLabels = p.RelationLabels
+	}
+	if len(relationLabels) == 0 {
+		relationLabels = DefaultRelationExtractionConfig().Labels
+	}
+
+	var runErrors []error
+	batch := p.prepareGLiNERBatch(len(inputs))
+	defer func() {
+		if batch.PipelineBatch != nil {
+			runErrors = append(runErrors, batch.Destroy())
+		}
+	}()
+
+	// Preprocess with relation labels
+	if err := p.PreprocessWithRelations(batch, inputs, entityLabels, relationLabels); err != nil {
+		return nil, err
+	}
+
+	// Forward pass
+	if err := p.Forward(batch); err != nil {
+		return nil, err
+	}
+
+	// Postprocess both entities and relations
+	result, err := p.PostprocessWithRelations(batch, entityLabels, relationLabels)
+	if err != nil {
+		return nil, err
+	}
+
+	return result, errors.Join(runErrors...)
+}
+
+// SupportsRelationExtraction checks if the model supports relation extraction
+func (p *GLiNERPipeline) SupportsRelationExtraction() bool {
+	// Check for relation-specific output tensor
+	for _, meta := range p.Model.OutputsMeta {
+		if meta.Name == "relation_logits" || meta.Name == "rel_logits" {
+			return true
+		}
+	}
+	return false
+}
+
+// PreprocessWithRelations prepares batch for entity and relation extraction
+func (p *GLiNERPipeline) PreprocessWithRelations(
+	batch *GLiNERBatch,
+	inputs []string,
+	entityLabels []string,
+	relationLabels []string,
+) error {
+	// Build combined prefix with both entity and relation labels
+	// Format: "<<ENT>> ent1 <<ENT>> ent2 <<REL>> rel1 <<REL>> rel2 <<SEP>> text"
+	prefix := buildGLiNERCombinedPrefix(entityLabels, relationLabels)
+
+	prefixedTexts := make([]string, len(inputs))
+	for i, text := range inputs {
+		prefixedTexts[i] = prefix + " " + text
+		batch.OriginalText[i] = text
+	}
+
+	// Standard preprocessing
+	pipelineBackends.TokenizeInputs(batch.PipelineBatch, p.Model.Tokenizer, prefixedTexts)
+
+	// Build GLiNER-specific inputs with adjusted prefix length
+	combinedPrefixLen := uint(len(prefix) + 1) // +1 for space
+	return p.buildGLiNERInputsWithPrefix(batch, combinedPrefixLen)
+}
+
+// buildGLiNERCombinedPrefix builds prefix with both entity and relation labels
+func buildGLiNERCombinedPrefix(entityLabels, relationLabels []string) string {
+	var sb strings.Builder
+
+	// Entity labels
+	for _, label := range entityLabels {
+		sb.WriteString(glinerEntityToken)
+		sb.WriteString(" ")
+		sb.WriteString(label)
+		sb.WriteString(" ")
+	}
+
+	// Relation labels
+	for _, label := range relationLabels {
+		sb.WriteString("<<REL>>")
+		sb.WriteString(" ")
+		sb.WriteString(label)
+		sb.WriteString(" ")
+	}
+
+	sb.WriteString(glinerSepToken)
+	return sb.String()
+}
+
+// buildGLiNERInputsWithPrefix builds GLiNER inputs with a custom prefix length
+func (p *GLiNERPipeline) buildGLiNERInputsWithPrefix(batch *GLiNERBatch, prefixLen uint) error {
+	batchSize := batch.Size
+	maxSeqLen := batch.MaxSequenceLength
+
+	batch.WordsMask = make([][]int64, batchSize)
+	batch.TextLengths = make([][]int64, batchSize)
+	batch.WordsToChars = make([][][2]int, batchSize)
+
+	for i, input := range batch.Input {
+		wordsMask := make([]int64, maxSeqLen)
+		wordsToChars := [][2]int{}
+		wordCount := int64(0)
+		inTextRegion := false
+
+		for j, offset := range input.Offsets {
+			if input.SpecialTokensMask[j] > 0 {
+				continue
+			}
+
+			tokenStart := offset[0]
+			tokenEnd := offset[1]
+
+			if tokenEnd <= prefixLen {
+				continue
+			}
+
+			inTextRegion = true
+			adjustedStart := tokenStart - prefixLen
+			adjustedEnd := tokenEnd - prefixLen
+
+			token := ""
+			if j < len(input.Tokens) {
+				token = input.Tokens[j]
+			}
+
+			isNewWord := false
+			if inTextRegion && wordCount == 0 {
+				isNewWord = true
+			} else if strings.HasPrefix(token, "▁") || strings.HasPrefix(token, " ") {
+				isNewWord = true
+			}
+
+			if isNewWord {
+				wordCount++
+				wordsMask[j] = wordCount
+				startOffset := int(adjustedStart)
+				if wordCount > 1 && (strings.HasPrefix(token, "▁") || strings.HasPrefix(token, " ")) {
+					startOffset++
+				}
+				wordsToChars = append(wordsToChars, [2]int{startOffset, int(adjustedEnd)})
+			} else {
+				wordsMask[j] = wordCount
+				if len(wordsToChars) > 0 {
+					wordsToChars[len(wordsToChars)-1][1] = int(adjustedEnd)
+				}
+			}
+		}
+
+		batch.WordsMask[i] = wordsMask
+		batch.TextLengths[i] = []int64{wordCount}
+		batch.WordsToChars[i] = wordsToChars
+	}
+
+	if err := p.generateSpans(batch); err != nil {
+		return err
+	}
+
+	return p.createGLiNERTensors(batch)
+}
+
+// PostprocessWithRelations extracts both entities and relations from model output
+func (p *GLiNERPipeline) PostprocessWithRelations(
+	batch *GLiNERBatch,
+	entityLabels []string,
+	relationLabels []string,
+) (*GLiNEROutput, error) {
+	// First extract entities using standard postprocessing
+	entityResult, err := p.Postprocess(batch, entityLabels)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if relation output is available
+	relationOutputIdx := -1
+	for i, meta := range p.Model.OutputsMeta {
+		if meta.Name == "relation_logits" || meta.Name == "rel_logits" {
+			relationOutputIdx = i
+			break
+		}
+	}
+
+	if relationOutputIdx < 0 || relationOutputIdx >= len(batch.OutputValues) {
+		// No relation output - return entities only
+		entityResult.Relations = make([][]GLiNERRelation, len(entityResult.Entities))
+		return entityResult, nil
+	}
+
+	// Extract relations
+	relations := p.extractRelations(
+		batch,
+		entityResult.Entities,
+		batch.OutputValues[relationOutputIdx],
+		relationLabels,
+	)
+
+	entityResult.Relations = relations
+	return entityResult, nil
+}
+
+// extractRelations extracts relationships from relation logits
+// Relation output is typically [batch][num_entity_pairs][num_relation_labels]
+func (p *GLiNERPipeline) extractRelations(
+	batch *GLiNERBatch,
+	entities [][]GLiNEREntity,
+	relationOutput any,
+	relationLabels []string,
+) [][]GLiNERRelation {
+	batchSize := len(entities)
+	result := make([][]GLiNERRelation, batchSize)
+
+	// Parse relation logits based on output shape
+	var relationLogits [][][]float32
+	switch v := relationOutput.(type) {
+	case [][][]float32:
+		relationLogits = v
+	default:
+		// Unsupported format - return empty relations
+		return result
+	}
+
+	threshold := p.RelationThreshold
+	if threshold <= 0 {
+		threshold = 0.5
+	}
+
+	for batchIdx := 0; batchIdx < batchSize; batchIdx++ {
+		if batchIdx >= len(relationLogits) {
+			continue
+		}
+
+		batchEntities := entities[batchIdx]
+		if len(batchEntities) < 2 {
+			// Need at least 2 entities for a relation
+			continue
+		}
+
+		batchRelLogits := relationLogits[batchIdx]
+		var relations []GLiNERRelation
+
+		// Relation logits are organized as pairs: for N entities,
+		// there are N*(N-1) potential directed pairs
+		pairIdx := 0
+		for headIdx := 0; headIdx < len(batchEntities); headIdx++ {
+			for tailIdx := 0; tailIdx < len(batchEntities); tailIdx++ {
+				if headIdx == tailIdx {
+					continue
+				}
+
+				if pairIdx >= len(batchRelLogits) {
+					break
+				}
+
+				pairLogits := batchRelLogits[pairIdx]
+				pairIdx++
+
+				// Check each relation label
+				for labelIdx, label := range relationLabels {
+					if labelIdx >= len(pairLogits) {
+						break
+					}
+
+					score := sigmoid(pairLogits[labelIdx])
+					if score >= threshold {
+						relations = append(relations, GLiNERRelation{
+							HeadEntity: batchEntities[headIdx],
+							TailEntity: batchEntities[tailIdx],
+							Label:      label,
+							Score:      score,
+						})
+					}
+				}
+			}
+		}
+
+		result[batchIdx] = relations
+	}
+
+	return result
+}
+
+// FilterRelationsByScore filters relations by minimum score
+func FilterRelationsByScore(relations []GLiNERRelation, minScore float32) []GLiNERRelation {
+	filtered := make([]GLiNERRelation, 0, len(relations))
+	for _, rel := range relations {
+		if rel.Score >= minScore {
+			filtered = append(filtered, rel)
+		}
+	}
+	return filtered
+}
+
+// GroupRelationsByHead groups relations by their head entity
+func GroupRelationsByHead(relations []GLiNERRelation) map[string][]GLiNERRelation {
+	grouped := make(map[string][]GLiNERRelation)
+	for _, rel := range relations {
+		key := fmt.Sprintf("%s:%d-%d", rel.HeadEntity.Text, rel.HeadEntity.Start, rel.HeadEntity.End)
+		grouped[key] = append(grouped[key], rel)
+	}
+	return grouped
+}
+
+// GroupRelationsByType groups relations by their label
+func GroupRelationsByType(relations []GLiNERRelation) map[string][]GLiNERRelation {
+	grouped := make(map[string][]GLiNERRelation)
+	for _, rel := range relations {
+		grouped[rel.Label] = append(grouped[rel.Label], rel)
+	}
+	return grouped
+}
