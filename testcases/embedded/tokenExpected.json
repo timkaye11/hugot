@@ -1,0 +1,68 @@
+{
+    "0": {
+        "entities": [
+        [
+            {
+                "Entity": "PER",
+                "Score": 0.99230945,
+                "Word": "Wolfgang",
+                "Start": 11,
+                "End": 19
+            },
+            {
+                "Entity": "LOC",
+                "Score": 0.997545,
+                "Word": "Berlin",
+                "Start": 34,
+                "End": 40
+            }
+        ]
+    ]},
+    "1": {"entities": [
+        [
+            {
+                "index": 4,
+                "Entity": "B-PER",
+                "Score": 0.9923094511032104,
+                "Word": "Wolfgang",
+                "Start": 11,
+                "End": 19
+            },
+            {
+                "index": 9,
+                "Entity": "B-LOC",
+                "Score": 0.997545063495636,
+                "Word": "Berlin",
+                "Start": 34,
+                "End": 40
+            }
+        ]
+    ]},
+    "2": {"entities": [
+        [
+            {
+                "Entity": "ORG",
+                "Score": 0.9953675270080566,
+                "Word": "Microsoft",
+                "Start": 0,
+                "End": 9
+            }
+        ],
+        [
+            {
+                "Entity": "LOC",
+                "Score": 0.9979496598243713,
+                "Word": "Berlin",
+                "Start": 20,
+                "End": 26
+            },
+            {
+                "Entity": "PER",
+                "Score": 0.9973982572555542,
+                "Word": "Jack Brown",
+                "Start": 40,
+                "End": 50
+            }
+        ]
+    ]}
+}

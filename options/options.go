@@ -5,11 +5,11 @@ import (
 )
 
 type Options struct {
-	Backend        string
+	BackendOptions any
 	ORTOptions     *OrtOptions
 	GoMLXOptions   *GoMLXOptions
 	Destroy        func() error
-	BackendOptions any
+	Backend        string
 }
 
 func Defaults() *Options {
@@ -38,13 +38,13 @@ type OrtOptions struct {
 	OpenVINOOptions       map[string]string
 	TensorRTOptions       map[string]string
 }
-
 type GoMLXOptions struct {
 	Cuda bool
 	XLA  bool
+	TPU  bool
 }
 
-// WithOption is the interface for all option functions
+// WithOption is the interface for all option functions.
 type WithOption func(o *Options) error
 
 // WithOnnxLibraryPath (ORT only) Use this function to set the path to the "onnxbackend.so" or "onnxbackend.dll" function.
@@ -95,15 +95,15 @@ func WithInterOpNumThreads(numThreads int) WithOption {
 	}
 }
 
-// WithCpuMemArena (ORT only) Enable/Disable the usage of the memory arena on CPU.
+// WithCPUMemArena (ORT only) Enable/Disable the usage of the memory arena on CPU.
 // Arena may pre-allocate memory for future usage. Default is true.
-func WithCpuMemArena(enable bool) WithOption {
+func WithCPUMemArena(enable bool) WithOption {
 	return func(o *Options) error {
 		if o.Backend == "ORT" {
 			o.ORTOptions.CPUMemArena = &enable
 			return nil
 		}
-		return fmt.Errorf("WithCpuMemArena is only supported for ORT backend")
+		return fmt.Errorf("WithCPUMemArena is only supported for ORT backend")
 	}
 }
 
@@ -169,6 +169,19 @@ func WithCuda(options map[string]string) WithOption {
 		default:
 			return fmt.Errorf("WithCuda is only supported for ORT or XLA backends")
 		}
+	}
+}
+
+// WithTPU (XLA only) Use this function to enable TPU acceleration for the XLA backend.
+// Requires libtpu.so to be available (pre-installed on GKE TPU nodes).
+// Set PJRT_PLUGIN_LIBRARY_PATH to the directory containing pjrt_plugin_tpu.so or libtpu.so.
+func WithTPU() WithOption {
+	return func(o *Options) error {
+		if o.Backend == "XLA" {
+			o.GoMLXOptions.TPU = true
+			return nil
+		}
+		return fmt.Errorf("WithTPU is only supported for XLA backend")
 	}
 }
 

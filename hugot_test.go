@@ -1,7 +1,6 @@
 package hugot
 
 import (
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -13,18 +12,13 @@ import (
 	"github.com/gomlx/go-huggingface/hub"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/knights-analytics/hugot/pipelineBackends"
+	"github.com/knights-analytics/hugot/backends"
 	"github.com/knights-analytics/hugot/pipelines"
-	"github.com/knights-analytics/hugot/util"
+	"github.com/knights-analytics/hugot/testcases/embedded"
+	"github.com/knights-analytics/hugot/util/imageutil"
 )
 
-//go:embed testData/tokenExpected.json
-var tokenExpectedByte []byte
-
-//go:embed testData/vectors.json
-var resultsByte []byte
-
-// use the system library for the tests
+// use the system library for the tests.
 const onnxRuntimeSharedLibrary = "/usr/lib64/onnxruntime.so"
 
 // test download validation
@@ -56,7 +50,7 @@ func featureExtractionPipeline(t *testing.T, session *Session) {
 	checkT(t, err)
 
 	var expectedResults map[string][][]float32
-	err = json.Unmarshal(resultsByte, &expectedResults)
+	err = json.Unmarshal(embedded.ResultsByte, &expectedResults)
 	checkT(t, err)
 	var testResults [][]float32
 
@@ -180,12 +174,12 @@ func featureExtractionPipelineValidation(t *testing.T, session *Session) {
 	pipeline, err := NewPipeline(session, config)
 	checkT(t, err)
 
-	pipeline.Model.InputsMeta[0].Dimensions = pipelineBackends.NewShape(-1, -1, -1)
+	pipeline.Model.InputsMeta[0].Dimensions = backends.NewShape(-1, -1, -1)
 
 	err = pipeline.Validate()
 	assert.Error(t, err)
 
-	pipeline.Model.InputsMeta[0].Dimensions = pipelineBackends.NewShape(1, 1, 1, 1)
+	pipeline.Model.InputsMeta[0].Dimensions = backends.NewShape(1, 1, 1, 1)
 	err = pipeline.Validate()
 	assert.Error(t, err)
 }
@@ -242,8 +236,8 @@ func textClassificationPipeline(t *testing.T, session *Session) {
 		}
 	})
 
-	// check get stats
-	session.GetStats()
+	// check PrintStatistics
+	session.PrintStatistics()
 }
 
 func textClassificationPipelineMulti(t *testing.T, session *Session) {
@@ -401,8 +395,12 @@ func textClassificationPipelineMulti(t *testing.T, session *Session) {
 		}
 	})
 
-	// check get stats
-	session.GetStats()
+	// check GetStatistics
+	statistics := session.GetStatistics()
+	for m, v := range statistics {
+		fmt.Printf("pipeline statistics for: %s\n", m)
+		v.Print()
+	}
 }
 
 func textClassificationPipelineValidation(t *testing.T, session *Session) {
@@ -435,7 +433,7 @@ func textClassificationPipelineValidation(t *testing.T, session *Session) {
 		defer func() {
 			sentimentPipeline.Model.OutputsMeta[0].Dimensions = dimensionInitial
 		}()
-		sentimentPipeline.Model.OutputsMeta[0].Dimensions = pipelineBackends.NewShape(-1, -1, -1)
+		sentimentPipeline.Model.OutputsMeta[0].Dimensions = backends.NewShape(-1, -1, -1)
 		err = sentimentPipeline.Validate()
 		assert.Error(t, err)
 	})
@@ -451,7 +449,7 @@ func zeroShotClassificationPipeline(t *testing.T, session *Session) {
 	config := ZeroShotClassificationConfig{
 		ModelPath: modelPath,
 		Name:      "testPipeline",
-		Options: []pipelineBackends.PipelineOption[*pipelines.ZeroShotClassificationPipeline]{
+		Options: []backends.PipelineOption[*pipelines.ZeroShotClassificationPipeline]{
 			pipelines.WithHypothesisTemplate("This example is {}."),
 			pipelines.WithLabels([]string{"fun", "dangerous"}),
 			pipelines.WithMultilabel(false), // Gets overridden per test, but included for coverage
@@ -694,7 +692,7 @@ func zeroShotClassificationPipelineValidation(t *testing.T, session *Session) {
 		defer func() {
 			sentimentPipeline.Model.OutputsMeta[0].Dimensions = dimensionInitial
 		}()
-		sentimentPipeline.Model.OutputsMeta[0].Dimensions = pipelineBackends.NewShape(-1, -1, -1)
+		sentimentPipeline.Model.OutputsMeta[0].Dimensions = backends.NewShape(-1, -1, -1)
 		err = sentimentPipeline.Validate()
 		assert.Error(t, err)
 	})
@@ -727,8 +725,21 @@ func tokenClassificationPipeline(t *testing.T, session *Session) {
 	pipelineNone, err3 := NewPipeline(session, configNone)
 	checkT(t, err3)
 
+	// Split-words enabled pipeline
+	configSplit := TokenClassificationConfig{
+		ModelPath: modelPath,
+		Name:      "testPipelineSplitWords",
+		Options: []TokenClassificationOption{
+			pipelines.WithSimpleAggregation(),
+			pipelines.WithIgnoreLabels([]string{"O"}),
+			pipelines.WithSplitWords(),
+		},
+	}
+	pipelineSplit, errSplit := NewPipeline(session, configSplit)
+	checkT(t, errSplit)
+
 	var expectedResults map[int]pipelines.TokenClassificationOutput
-	err4 := json.Unmarshal(tokenExpectedByte, &expectedResults)
+	err4 := json.Unmarshal(embedded.TokenExpectedByte, &expectedResults)
 	checkT(t, err4)
 
 	tests := []struct {
@@ -772,6 +783,65 @@ func tokenClassificationPipeline(t *testing.T, session *Session) {
 			}
 		})
 	}
+
+	// Expect same entities as the simple aggregation for the equivalent sentence for split words
+	t.Run("Split words aggregation", func(t *testing.T) {
+		words := [][]string{{"My", "name", "is", "Wolfgang", "and", "I", "live", "in", "Berlin", "."}}
+		batchResult, err := pipelineSplit.RunWords(words)
+		checkT(t, err)
+		printTokenEntities(batchResult)
+		expected := expectedResults[0]
+		for i, predictedEntities := range batchResult.Entities {
+			assert.Equal(t, len(expected.Entities[i]), len(predictedEntities))
+			for j, entity := range predictedEntities {
+				expectedEntity := expected.Entities[i][j]
+				assert.Equal(t, expectedEntity.Entity, entity.Entity)
+				assert.Equal(t, expectedEntity.Word, entity.Word)
+			}
+		}
+	})
+
+	t.Run("Split words yields different offsets vs double-space input", func(t *testing.T) {
+		// Non-split input with double space changes raw offsets.
+		nonSplit := []string{"New  York is great."}
+		splitWords := [][]string{{"New", "York", "is", "great", "."}}
+
+		resNonSplit, errNon := pipelineSimple.RunPipeline(nonSplit)
+		checkT(t, errNon)
+		resSplit, errSplitRun := pipelineSplit.RunWords(splitWords)
+		checkT(t, errSplitRun)
+
+		// Compare first sequence: entity words may match, but offsets should differ due to space normalization.
+		if len(resNonSplit.Entities) > 0 && len(resSplit.Entities) > 0 && len(resNonSplit.Entities[0]) > 0 && len(resSplit.Entities[0]) > 0 {
+			eNon := resNonSplit.Entities[0][0]
+			eSplit := resSplit.Entities[0][0]
+			assert.NotEqual(t, fmt.Sprintf("%d-%d", eNon.Start, eNon.End), fmt.Sprintf("%d-%d", eSplit.Start, eSplit.End))
+		}
+	})
+
+	// Pre-tokenization splitting on 'X': expect different entity results from the non-split case
+	t.Run("Split on X detects entity", func(t *testing.T) {
+		nonSplit := []string{"XBerlinXXisXbeautiful."}
+		split := [][]string{{"Berlin is", "beautiful", "."}}
+
+		resNonSplit, errNS := pipelineSimple.RunPipeline(nonSplit)
+		checkT(t, errNS)
+		resSplit, errSW := pipelineSplit.RunWords(split)
+		checkT(t, errSW)
+
+		gotA := resNonSplit.Entities[0]
+		gotB := resSplit.Entities[0]
+		// Expect split-words to detect 'Berlin' as an entity, while non-split should not because of the confusing X characters.
+		hasBerlin := func(es []pipelines.Entity) bool {
+			for _, e := range es {
+				if strings.EqualFold(e.Word, "Berlin") {
+					return true
+				}
+			}
+			return false
+		}
+		assert.True(t, !hasBerlin(gotA) || len(gotA) < len(gotB), "expected split-words to surface 'Berlin' or increase entity count")
+	})
 }
 
 func tokenClassificationPipelineValidation(t *testing.T, session *Session) {
@@ -804,7 +874,7 @@ func tokenClassificationPipelineValidation(t *testing.T, session *Session) {
 		defer func() {
 			pipelineSimple.Model.OutputsMeta[0].Dimensions = dimensionInitial
 		}()
-		pipelineSimple.Model.OutputsMeta[0].Dimensions = pipelineBackends.NewShape(-1, -1, -1)
+		pipelineSimple.Model.OutputsMeta[0].Dimensions = backends.NewShape(-1, -1, -1)
 		err := pipelineSimple.Validate()
 		assert.Error(t, err)
 	})
@@ -813,6 +883,7 @@ func tokenClassificationPipelineValidation(t *testing.T, session *Session) {
 // Cross Encoder
 
 func crossEncoderPipeline(t *testing.T, session *Session) {
+	t.Helper()
 	config := CrossEncoderConfig{
 		ModelPath: "./models/KnightsAnalytics_jina-reranker-v1-tiny-en",
 		Name:      "test-cross-encoder",
@@ -868,6 +939,7 @@ func crossEncoderPipeline(t *testing.T, session *Session) {
 }
 
 func crossEncoderPipelineValidation(t *testing.T, session *Session) {
+	t.Helper()
 	config := CrossEncoderConfig{
 		ModelPath: "./models/KnightsAnalytics_jina-reranker-v1-tiny-en",
 		Name:      "test-cross-encoder-validation",
@@ -878,28 +950,28 @@ func crossEncoderPipelineValidation(t *testing.T, session *Session) {
 	}
 
 	// 1. Test: output dims length != 2
-	pipeline.Model.OutputsMeta[0].Dimensions = pipelineBackends.NewShape(1)
+	pipeline.Model.OutputsMeta[0].Dimensions = backends.NewShape(1)
 	err = pipeline.Validate()
 	if err == nil {
 		t.Errorf("Expected error for output dims length != 2, got %v", err)
 	}
 
 	// 2. Test: output dims second dim != 1
-	pipeline.Model.OutputsMeta[0].Dimensions = pipelineBackends.NewShape(2, 3)
+	pipeline.Model.OutputsMeta[0].Dimensions = backends.NewShape(2, 3)
 	err = pipeline.Validate()
 	if err == nil || err.Error() == "" {
 		t.Errorf("Expected error for output dims second dim != 1, got %v", err)
 	}
 
 	// 3. Test: more than one dynamic dim (-1)
-	pipeline.Model.OutputsMeta[0].Dimensions = pipelineBackends.NewShape(-1, -1)
+	pipeline.Model.OutputsMeta[0].Dimensions = backends.NewShape(-1, -1)
 	err = pipeline.Validate()
 	if err == nil || err.Error() == "" {
 		t.Errorf("Expected error for more than one dynamic dim, got %v", err)
 	}
 }
 
-// Image classification test using HuggingFace SqueezeNet and a sample image
+// Image classification test using HuggingFace SqueezeNet and a sample image.
 func imageClassificationPipeline(t *testing.T, session *Session) {
 	t.Helper()
 
@@ -913,12 +985,12 @@ func imageClassificationPipeline(t *testing.T, session *Session) {
 		Options: []ImageClassificationOption{
 			pipelines.WithTopK(3),
 			pipelines.WithPreprocessSteps(
-				util.ResizeStep(224),
-				util.CenterCropStep(224, 224),
+				imageutil.ResizeStep(224),
+				imageutil.CenterCropStep(224, 224),
 			),
 			pipelines.WithNormalizationSteps(
-				util.ImagenetPixelNormalizationStep(),
-				util.RescaleStep(),
+				imageutil.ImagenetPixelNormalizationStep(),
+				imageutil.RescaleStep(),
 			),
 		},
 	}
@@ -947,7 +1019,7 @@ func imageClassificationPipelineValidation(t *testing.T, session *Session) {
 	pipeline, err := NewPipeline(session, config)
 	checkT(t, err)
 
-	pipeline.Model.InputsMeta[0].Dimensions = pipelineBackends.NewShape(-1, -1, -1)
+	pipeline.Model.InputsMeta[0].Dimensions = backends.NewShape(-1, -1, -1)
 
 	err = pipeline.Validate()
 	assert.Error(t, err)
@@ -1011,7 +1083,7 @@ func destroyPipelines(t *testing.T, session *Session) {
 	}
 }
 
-// Text Generation
+// Text Generation.
 func textGenerationPipeline(t *testing.T, session *Session) {
 	t.Helper()
 
@@ -1025,7 +1097,7 @@ func textGenerationPipeline(t *testing.T, session *Session) {
 		ModelPath:    "./models/KnightsAnalytics_Phi-3.5-mini-instruct-onnx",
 		Name:         "testPipeline",
 		OnnxFilename: "model.onnx",
-		Options: []pipelineBackends.PipelineOption[*pipelines.TextGenerationPipeline]{
+		Options: []backends.PipelineOption[*pipelines.TextGenerationPipeline]{
 			pipelines.WithMaxTokens(200),
 			pipelines.WithPhiTemplate(),
 			pipelines.WithCustomStopTokens([]int64{32007}), // Phi appears to use a stop token that's different from the one defined in config.json
@@ -1132,7 +1204,7 @@ func textGenerationPipelineValidation(t *testing.T, session *Session) {
 		ModelPath:    "./models/KnightsAnalytics_Phi-3.5-mini-instruct-onnx",
 		Name:         "testPipeline",
 		OnnxFilename: "model.onnx",
-		Options: []pipelineBackends.PipelineOption[*pipelines.TextGenerationPipeline]{
+		Options: []backends.PipelineOption[*pipelines.TextGenerationPipeline]{
 			pipelines.WithMaxTokens(1),
 		},
 	}
@@ -1160,6 +1232,7 @@ func textGenerationPipelineValidation(t *testing.T, session *Session) {
 // Thread safety
 
 func threadSafety(t *testing.T, session *Session, numEmbeddings int) {
+	t.Helper()
 	numWorkers := min(runtime.NumCPU(), 6)
 	numResults := numWorkers * numEmbeddings
 
@@ -1174,7 +1247,7 @@ func threadSafety(t *testing.T, session *Session, numEmbeddings int) {
 	checkT(t, err)
 
 	var expectedResults map[string][][]float32
-	err = json.Unmarshal(resultsByte, &expectedResults)
+	err = json.Unmarshal(embedded.ResultsByte, &expectedResults)
 	checkT(t, err)
 	expectedResult1 := expectedResults["test1output"]
 	expectedResult2 := expectedResults["test2output"]

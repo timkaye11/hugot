@@ -3,57 +3,54 @@ package pipelines
 import (
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"sync/atomic"
 	"time"
 
+	"github.com/knights-analytics/hugot/backends"
 	"github.com/knights-analytics/hugot/options"
-	"github.com/knights-analytics/hugot/pipelineBackends"
-	"github.com/knights-analytics/hugot/util"
+	"github.com/knights-analytics/hugot/util/safeconv"
+	"github.com/knights-analytics/hugot/util/vectorutil"
 )
 
 type CrossEncoderPipeline struct {
-	*pipelineBackends.BasePipeline
+	*backends.BasePipeline
+	scoreThreshold *float32
+	statistics     CrossEncoderStatistics
 	batchSize      int
 	sortResults    bool
-	scoreThreshold *float32
-	stats          CrossEncoderStats
 }
-
-type CrossEncoderStats struct {
+type CrossEncoderStatistics struct {
 	TotalQueries     uint64
 	TotalDocuments   uint64
 	AverageLatency   time.Duration
 	AverageBatchSize float64
 	FilteredResults  uint64
 }
-
 type CrossEncoderResult struct {
 	Document string
 	Score    float32
 	Index    int
 }
-
 type CrossEncoderOutput struct {
 	Results []CrossEncoderResult
 }
 
-func WithBatchSize(size int) pipelineBackends.PipelineOption[*CrossEncoderPipeline] {
+func WithBatchSize(size int) backends.PipelineOption[*CrossEncoderPipeline] {
 	return func(p *CrossEncoderPipeline) error {
 		p.batchSize = size
 		return nil
 	}
 }
 
-func WithSortResults(sort bool) pipelineBackends.PipelineOption[*CrossEncoderPipeline] {
+func WithSortResults(sort bool) backends.PipelineOption[*CrossEncoderPipeline] {
 	return func(p *CrossEncoderPipeline) error {
 		p.sortResults = sort
 		return nil
 	}
 }
 
-func WithScoreThreshold(threshold float32) pipelineBackends.PipelineOption[*CrossEncoderPipeline] {
+func WithScoreThreshold(threshold float32) backends.PipelineOption[*CrossEncoderPipeline] {
 	return func(p *CrossEncoderPipeline) error {
 		p.scoreThreshold = &threshold
 		return nil
@@ -68,25 +65,22 @@ func (t *CrossEncoderOutput) GetOutput() []any {
 	return out
 }
 
-func NewCrossEncoderPipeline(config pipelineBackends.PipelineConfig[*CrossEncoderPipeline], s *options.Options, model *pipelineBackends.Model) (*CrossEncoderPipeline, error) {
-	defaultPipeline, err := pipelineBackends.NewBasePipeline(config, s, model)
+func NewCrossEncoderPipeline(config backends.PipelineConfig[*CrossEncoderPipeline], s *options.Options, model *backends.Model) (*CrossEncoderPipeline, error) {
+	defaultPipeline, err := backends.NewBasePipeline(config, s, model)
 	if err != nil {
 		return nil, err
 	}
-
 	pipeline := &CrossEncoderPipeline{
 		BasePipeline: defaultPipeline,
 		batchSize:    1,
 		sortResults:  true,
 	}
-
 	for _, o := range config.Options {
 		err = o(pipeline)
 		if err != nil {
 			return nil, err
 		}
 	}
-
 	err = pipeline.Validate()
 	if err != nil {
 		return nil, err
@@ -94,13 +88,13 @@ func NewCrossEncoderPipeline(config pipelineBackends.PipelineConfig[*CrossEncode
 	return pipeline, nil
 }
 
-func (p *CrossEncoderPipeline) GetModel() *pipelineBackends.Model {
+func (p *CrossEncoderPipeline) GetModel() *backends.Model {
 	return p.Model
 }
 
-func (p *CrossEncoderPipeline) GetMetadata() pipelineBackends.PipelineMetadata {
-	return pipelineBackends.PipelineMetadata{
-		OutputsInfo: []pipelineBackends.OutputInfo{
+func (p *CrossEncoderPipeline) GetMetadata() backends.PipelineMetadata {
+	return backends.PipelineMetadata{
+		OutputsInfo: []backends.OutputInfo{
 			{
 				Name:       p.Model.OutputsMeta[0].Name,
 				Dimensions: p.Model.OutputsMeta[0].Dimensions,
@@ -109,52 +103,39 @@ func (p *CrossEncoderPipeline) GetMetadata() pipelineBackends.PipelineMetadata {
 	}
 }
 
-func (p *CrossEncoderPipeline) GetStats() []string {
-	avgLatency := p.stats.AverageLatency
-	if p.stats.TotalQueries > 0 {
-		avgLatency = time.Duration(float64(p.stats.AverageLatency) / float64(p.stats.TotalQueries))
+func (p *CrossEncoderPipeline) GetStatistics() backends.PipelineStatistics {
+	avgLatency := p.statistics.AverageLatency
+	if p.statistics.TotalQueries > 0 {
+		avgLatency = time.Duration(float64(p.statistics.AverageLatency) / float64(p.statistics.TotalQueries))
 	}
-
-	return []string{
-		fmt.Sprintf("Statistics for pipeline: %s", p.PipelineName),
-		fmt.Sprintf("Total queries processed: %d", p.stats.TotalQueries),
-		fmt.Sprintf("Total documents scored: %d", p.stats.TotalDocuments),
-		fmt.Sprintf("Average latency per query: %s", avgLatency),
-		fmt.Sprintf("Average batch size: %.2f", p.stats.AverageBatchSize),
-		fmt.Sprintf("Filtered results: %d", p.stats.FilteredResults),
-		fmt.Sprintf("Tokenizer: Total time=%s, Execution count=%d, Average query time=%s",
-			time.Duration(p.Model.Tokenizer.TokenizerTimings.TotalNS),
-			p.Model.Tokenizer.TokenizerTimings.NumCalls,
-			time.Duration(float64(p.Model.Tokenizer.TokenizerTimings.TotalNS)/math.Max(1, float64(p.Model.Tokenizer.TokenizerTimings.NumCalls)))),
-		fmt.Sprintf("ONNX: Total time=%s, Execution count=%d, Average query time=%s",
-			time.Duration(p.PipelineTimings.TotalNS),
-			p.PipelineTimings.NumCalls,
-			time.Duration(float64(p.PipelineTimings.TotalNS)/math.Max(1, float64(p.PipelineTimings.NumCalls)))),
-	}
+	statistics := backends.PipelineStatistics{}
+	statistics.ComputeTokenizerStatistics(p.Model.Tokenizer.TokenizerTimings)
+	statistics.ComputeOnnxStatistics(p.PipelineTimings)
+	statistics.TotalQueries = p.statistics.TotalQueries
+	statistics.TotalDocuments = p.statistics.TotalDocuments
+	statistics.AverageLatency = avgLatency
+	statistics.AverageBatchSize = p.statistics.AverageBatchSize
+	statistics.FilteredResults = p.statistics.FilteredResults
+	return statistics
 }
 
 func (p *CrossEncoderPipeline) Validate() error {
 	var validationErrors []error
-
 	if p.Model.Tokenizer == nil {
 		validationErrors = append(validationErrors, fmt.Errorf("cross encoder pipeline requires a tokenizer"))
 	}
-
 	if p.Model.SeparatorToken == "" {
 		validationErrors = append(validationErrors, fmt.Errorf("cross encoder pipeline requires a separator token to be set in the model"))
 	}
-
 	if p.Model.SeparatorToken != "[SEP]" && p.Model.SeparatorToken != "</s>" {
 		validationErrors = append(validationErrors, fmt.Errorf("cross encoder pipeline only supports [SEP] (BERT) and </s> (Roberta) as separator tokens, got %s", p.Model.SeparatorToken))
 	}
-
 	outDims := p.Model.OutputsMeta[0].Dimensions
 	if len(outDims) != 2 {
 		validationErrors = append(validationErrors, fmt.Errorf("pipeline configuration invalid: cross encoder must have 2 dimensional output"))
 	} else if outDims[1] != 1 {
 		validationErrors = append(validationErrors, fmt.Errorf("pipeline configuration invalid: cross encoder output's second dimension must be 1, but got %d", outDims[1]))
 	}
-
 	dynamicBatch := false
 	for _, d := range outDims {
 		if d == -1 {
@@ -165,15 +146,13 @@ func (p *CrossEncoderPipeline) Validate() error {
 			dynamicBatch = true
 		}
 	}
-
 	if p.batchSize <= 0 {
 		validationErrors = append(validationErrors, fmt.Errorf("batch size must be positive, got %d", p.batchSize))
 	}
-
 	return errors.Join(validationErrors...)
 }
 
-func patchBertSequenceTokenTypeIDs(batch *pipelineBackends.PipelineBatch, sepToken string) {
+func patchBertSequenceTokenTypeIDs(batch *backends.PipelineBatch, sepToken string) {
 	// Fix token_type_ids for BERT-style models when we manually concatenated the pair as a single sequence.
 	// Pattern expected: [CLS] query [SEP] doc [SEP]
 	// HF sets token_type_ids=0 up to and including first [SEP], then 1 for remainder (including final [SEP]).
@@ -207,75 +186,63 @@ func patchBertSequenceTokenTypeIDs(batch *pipelineBackends.PipelineBatch, sepTok
 	}
 }
 
-func (p *CrossEncoderPipeline) Preprocess(batch *pipelineBackends.PipelineBatch, inputs []string) error {
+func (p *CrossEncoderPipeline) Preprocess(batch *backends.PipelineBatch, inputs []string) error {
 	start := time.Now()
-
-	pipelineBackends.TokenizeInputs(batch, p.Model.Tokenizer, inputs)
-
+	backends.TokenizeInputs(batch, p.Model.Tokenizer, inputs)
 	if p.Model != nil && p.Model.Tokenizer != nil && p.Model.SeparatorToken == "[SEP]" {
 		patchBertSequenceTokenTypeIDs(batch, p.Model.SeparatorToken)
 	}
-
 	atomic.AddUint64(&p.Model.Tokenizer.TokenizerTimings.NumCalls, 1)
-	atomic.AddUint64(&p.Model.Tokenizer.TokenizerTimings.TotalNS, uint64(time.Since(start)))
-	err := pipelineBackends.CreateInputTensors(batch, p.Model, p.Runtime)
+	atomic.AddUint64(&p.Model.Tokenizer.TokenizerTimings.TotalNS, safeconv.DurationToU64(time.Since(start)))
+	err := backends.CreateInputTensors(batch, p.Model, p.Runtime)
 	return err
 }
 
-func (p *CrossEncoderPipeline) Forward(batch *pipelineBackends.PipelineBatch) error {
+func (p *CrossEncoderPipeline) Forward(batch *backends.PipelineBatch) error {
 	start := time.Now()
-
 	if p.Model.Tokenizer.MaxAllowedTokens >= p.Model.MaxPositionEmbeddings {
 		p.Model.Tokenizer.MaxAllowedTokens = p.Model.MaxPositionEmbeddings - 1
 	}
-
-	err := pipelineBackends.RunSessionOnBatch(batch, p.BasePipeline)
+	err := backends.RunSessionOnBatch(batch, p.BasePipeline)
 	if err != nil {
 		return err
 	}
 	atomic.AddUint64(&p.PipelineTimings.NumCalls, 1)
-	atomic.AddUint64(&p.PipelineTimings.TotalNS, uint64(time.Since(start)))
+	atomic.AddUint64(&p.PipelineTimings.TotalNS, safeconv.DurationToU64(time.Since(start)))
 	return nil
 }
 
-func (p *CrossEncoderPipeline) Postprocess(batch *pipelineBackends.PipelineBatch, documents []string) (*CrossEncoderOutput, error) {
+func (p *CrossEncoderPipeline) Postprocess(batch *backends.PipelineBatch, documents []string) (*CrossEncoderOutput, error) {
 	var outputCast [][]float32
-
 	output := batch.OutputValues[0]
-
 	switch v := output.(type) {
 	case [][]float32:
 		outputCast = make([][]float32, len(v))
 		for i, logits := range v {
-			scores := util.Sigmoid(logits)
+			scores := vectorutil.Sigmoid(logits)
 			outputCast[i] = scores
 		}
 	default:
 		return nil, fmt.Errorf("output is not 2D, expected batch size x logits, got %T", output)
 	}
-
 	results := make([]CrossEncoderResult, 0, len(documents))
 	for i := range documents {
 		score := outputCast[i][0]
-
 		if p.scoreThreshold != nil && score < *p.scoreThreshold {
-			atomic.AddUint64(&p.stats.FilteredResults, 1)
+			atomic.AddUint64(&p.statistics.FilteredResults, 1)
 			continue
 		}
-
 		result := CrossEncoderResult{
 			Document: documents[i],
 			Score:    score,
 			Index:    i,
 		}
-
 		results = append(results, result)
 	}
-
 	return &CrossEncoderOutput{Results: results}, nil
 }
 
-func (p *CrossEncoderPipeline) Run(inputs []string) (pipelineBackends.PipelineBatchOutput, error) {
+func (p *CrossEncoderPipeline) Run(inputs []string) (backends.PipelineBatchOutput, error) {
 	if len(inputs) < 2 {
 		return nil, errors.New("cross encoder pipeline requires at least two inputs: a query and one or more documents")
 	}
@@ -288,14 +255,12 @@ func (p *CrossEncoderPipeline) RunPipeline(query string, documents []string) (*C
 	start := time.Now()
 	defer func() {
 		duration := time.Since(start)
-		p.stats.TotalQueries++
-		p.stats.TotalDocuments += uint64(len(documents))
-		p.stats.AverageLatency += duration
+		p.statistics.TotalQueries++
+		p.statistics.TotalDocuments += uint64(len(documents))
+		p.statistics.AverageLatency += duration
 	}()
-
 	var runErrors []error
 	allResults := make([]CrossEncoderResult, 0, len(documents))
-
 	for i := 0; i < len(documents); i += p.batchSize {
 		end := min(i+p.batchSize, len(documents))
 		out, err := p.runBatch(query, documents[i:end], i)
@@ -305,7 +270,6 @@ func (p *CrossEncoderPipeline) RunPipeline(query string, documents []string) (*C
 		}
 		allResults = append(allResults, out.Results...)
 	}
-
 	if p.sortResults {
 		sort.SliceStable(allResults, func(i, j int) bool {
 			if allResults[i].Score == allResults[j].Score {
@@ -314,20 +278,16 @@ func (p *CrossEncoderPipeline) RunPipeline(query string, documents []string) (*C
 			return allResults[i].Score > allResults[j].Score
 		})
 	}
-
 	output := &CrossEncoderOutput{
 		Results: allResults,
 	}
-
 	return output, errors.Join(runErrors...)
 }
 
 func (p *CrossEncoderPipeline) runBatch(query string, documents []string, startIndex int) (*CrossEncoderOutput, error) {
 	var runErrors []error
-
 	inputs := make([]string, len(documents))
 	sep := p.Model.SeparatorToken
-
 	for i, doc := range documents {
 		if sep == "</s>" {
 			// RoBERTa style: query </s> </s> document
@@ -337,32 +297,24 @@ func (p *CrossEncoderPipeline) runBatch(query string, documents []string, startI
 			inputs[i] = fmt.Sprintf("%s%s%s", query, sep, doc)
 		}
 	}
-
-	batch := pipelineBackends.NewBatch(len(inputs))
-
-	defer func(*pipelineBackends.PipelineBatch) {
+	batch := backends.NewBatch(len(inputs))
+	defer func(*backends.PipelineBatch) {
 		runErrors = append(runErrors, batch.Destroy())
 	}(batch)
-
 	runErrors = append(runErrors, p.Preprocess(batch, inputs))
-
 	if e := errors.Join(runErrors...); e != nil {
 		return nil, e
 	}
-
 	runErrors = append(runErrors, p.Forward(batch))
 	if e := errors.Join(runErrors...); e != nil {
 		return nil, e
 	}
-
 	result, postErr := p.Postprocess(batch, documents)
 	runErrors = append(runErrors, postErr)
-
 	if result != nil {
 		for i := range result.Results {
 			result.Results[i].Index += startIndex
 		}
 	}
-
 	return result, errors.Join(runErrors...)
 }

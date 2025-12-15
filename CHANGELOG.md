@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [0.5.10] - 2025-12-08
+
+### Breaking changes
+
+- breaking: GetStatistics on a session returns a map of pipeline name to statistics object
+
+## [0.5.9] - 2025-12-08
+
+### Breaking changes
+
+- breaking: GetStatistics now returns a Statistics struct for the pipelines rather than a list of strings
+- breaking: pipelineBackends has been renamed to backends
+
+### Changes
+
+- update of onnxruntime_go, goMLX, gopjrt
+
+### Improvements
+
+- support splitIntoWords for tokenClassificationPipeline
+
 ## [0.5.8] - 2025-11-22
 
 ### Changed
@@ -23,7 +44,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 ### Changed
 
 - Update to new goMLX project structure (0.24.0+)
-- remove the depency on python when installing goMLX libraries
+- remove the dependency on python when installing goMLX libraries
 
 ## [0.5.5] - 2025-09-30
 

@@ -15,7 +15,7 @@ import (
 	"github.com/knights-analytics/hugot/datasets"
 	"github.com/knights-analytics/hugot/options"
 	"github.com/knights-analytics/hugot/pipelines"
-	"github.com/knights-analytics/hugot/util"
+	"github.com/knights-analytics/hugot/util/fileutil"
 )
 
 func cosineSimilarityTester(x []float32, y []float32) float64 {
@@ -82,8 +82,10 @@ func round3decimals(x float64) float64 {
 
 func trainSimilarity(t *testing.T,
 	config TrainingConfig,
-	examplesLhs,
-	examplesRhs []string) []float64 {
+	examplesLHS,
+	examplesRHS []string,
+) []float64 {
+	t.Helper()
 	// Create a new GoMLX training session. Currently, training is only possible by loading an onnx model
 	// into GoMLX, fine-tuning it, and then writing it back to onnx. Hugot deals with the details
 	// for you here.
@@ -118,7 +120,7 @@ func trainSimilarity(t *testing.T,
 	}()
 
 	// we now load the newly trained onnx model and generate the predictions with onnxruntime backend
-	return runModel(t, "ORT", examplesLhs, examplesRhs, "./models/testTrain")
+	return runModel(t, "ORT", examplesLHS, examplesRHS, "./models/testTrain")
 }
 
 func TestTrainSemanticSimilarity(t *testing.T) {
@@ -126,12 +128,12 @@ func TestTrainSemanticSimilarity(t *testing.T) {
 
 	// each line in this dataset is an example. In training we will use the dataset object but for inference
 	// we just load the strings here.
-	data, err := os.ReadFile("./testData/semanticSimilarityTest.jsonl")
+	data, err := os.ReadFile("./testcases/semanticSimilarityTest.jsonl")
 	checkT(t, err)
 	lines := bytes.Split(data, []byte("\n"))
 
-	var examplesLhs []string
-	var examplesRhs []string
+	var examplesLHS []string
+	var examplesRHS []string
 	var scores []float64
 
 	for _, line := range lines {
@@ -140,16 +142,16 @@ func TestTrainSemanticSimilarity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		examplesLhs = append(examplesLhs, example["sentence1"].(string))
-		examplesRhs = append(examplesRhs, example["sentence2"].(string))
+		examplesLHS = append(examplesLHS, example["sentence1"].(string))
+		examplesRHS = append(examplesRHS, example["sentence2"].(string))
 		scores = append(scores, example["score"].(float64))
 	}
 
 	// first we run the untrained onnx model with onnxruntime backend
-	similaritiesOnnxruntime := runModel(t, "ORT", examplesLhs, examplesRhs, modelPath)
+	similaritiesOnnxruntime := runModel(t, "ORT", examplesLHS, examplesRHS, modelPath)
 
 	// we do the same for GoMLX and check the forward pass results match
-	similaritiesGoMLX := runModel(t, "XLA", examplesLhs, examplesRhs, modelPath)
+	similaritiesGoMLX := runModel(t, "XLA", examplesLHS, examplesRHS, modelPath)
 
 	for i := range similaritiesOnnxruntime {
 		assert.Equal(t, round3decimals(similaritiesOnnxruntime[i]), round3decimals(similaritiesGoMLX[i]))
@@ -162,7 +164,7 @@ func TestTrainSemanticSimilarity(t *testing.T) {
 	// The datasets.NewSemanticSimilarityDataset function also accepts a custom function that will be applied
 	// to all examples in a batch before they are passed to the model. This can be used to apply whatever preprocessing
 	// you need.
-	trainDataset, err := datasets.NewSemanticSimilarityDataset("./testData/semanticSimilarityTest.jsonl", 1, nil)
+	trainDataset, err := datasets.NewSemanticSimilarityDataset("./testcases/semanticSimilarityTest.jsonl", 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +172,7 @@ func TestTrainSemanticSimilarity(t *testing.T) {
 	// next we create a trainEvalDataset. This is the same as the train dataset, but it will be used to evaluate the model on
 	// in-sample data at the end of each epoch.
 	// We can also specify an eval dataset with early stopping (see test below).
-	trainEvalDataset, err := datasets.NewSemanticSimilarityDataset("./testData/semanticSimilarityTest.jsonl", 1, nil)
+	trainEvalDataset, err := datasets.NewSemanticSimilarityDataset("./testcases/semanticSimilarityTest.jsonl", 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +187,7 @@ func TestTrainSemanticSimilarity(t *testing.T) {
 		},
 		Verbose: true,
 	}
-	similaritiesGoMLXTrained := trainSimilarity(t, trainingConfig, examplesLhs, examplesRhs)
+	similaritiesGoMLXTrained := trainSimilarity(t, trainingConfig, examplesLHS, examplesRHS)
 
 	fmt.Println("GoMLX trained model predictions:")
 	for i := range similaritiesGoMLXTrained {
@@ -202,24 +204,24 @@ func TestTrainSemanticSimilarity(t *testing.T) {
 
 	// we can also train a model using an in memory dataset. For this we create the slice of examples manually.
 	var examples []datasets.SemanticSimilarityExample
-	for i := 0; i < len(examplesLhs); i++ {
+	for i := 0; i < len(examplesLHS); i++ {
 		examples = append(examples, datasets.SemanticSimilarityExample{
-			Sentence1: examplesLhs[i],
-			Sentence2: examplesRhs[i],
+			Sentence1: examplesLHS[i],
+			Sentence2: examplesRHS[i],
 			Score:     float32(scores[i]),
 		})
 	}
 	inMemoryDataset, err := datasets.NewInMemorySemanticSimilarityDataset(examples, 1, nil)
 	checkT(t, err)
 	trainingConfig.TrainDataset = inMemoryDataset
-	similaritiesGoMLXTrainedInMemory := trainSimilarity(t, trainingConfig, examplesLhs, examplesRhs)
+	similaritiesGoMLXTrainedInMemory := trainSimilarity(t, trainingConfig, examplesLHS, examplesRHS)
 	for i := range similaritiesGoMLXTrainedInMemory {
 		assert.Equal(t, round3decimals(similaritiesGoMLXTrained[i]), round3decimals(similaritiesGoMLXTrainedInMemory[i]))
 	}
 
 	// we can also freeze layers
 	trainingConfig.Options = append(trainingConfig.Options, WithFreezeLayers([]int{-1})) // freeze all layers but the last one
-	similaritiesGoMLXTrainedFrozen := trainSimilarity(t, trainingConfig, examplesLhs, examplesRhs)
+	similaritiesGoMLXTrainedFrozen := trainSimilarity(t, trainingConfig, examplesLHS, examplesRHS)
 
 	fmt.Println("GoMLX trained model predictions freezing all layers but the last one:")
 	for i := range similaritiesGoMLXTrainedFrozen {
@@ -230,7 +232,7 @@ func TestTrainSemanticSimilarity(t *testing.T) {
 func rmse(predictions []float64, labels []float64) float64 {
 	var sum float64
 	for i := 0; i < len(predictions); i++ {
-		sum += math.Pow(predictions[i]-labels[i], 2)
+		sum += (predictions[i] - labels[i]) * (predictions[i] - labels[i])
 	}
 	return math.Sqrt(sum / float64(len(predictions)))
 }
@@ -240,7 +242,7 @@ func TestTrainSemanticSimilarityCuda(t *testing.T) {
 		t.SkipNow()
 	}
 
-	dataset, err := datasets.NewSemanticSimilarityDataset("./testData/semanticSimilarityTest.jsonl", 32, nil)
+	dataset, err := datasets.NewSemanticSimilarityDataset("./testcases/semanticSimilarityTest.jsonl", 32, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,12 +273,12 @@ func TestTrainSemanticSimilarityCuda(t *testing.T) {
 	if e := session.Save("./models/testTrain"); e != nil {
 		t.Fatal(e)
 	}
-	if exists, existsErr := util.FileExists("./models/testTrain"); existsErr != nil {
+	if exists, existsErr := fileutil.FileExists("./models/testTrain"); existsErr != nil {
 		t.Fatal(err)
 	} else if !exists {
 		t.Fatal("model file ./models/testTrain does not exist")
 	}
-	if err = util.DeleteFile("./models/testTrain"); err != nil {
+	if err = fileutil.DeleteFile("./models/testTrain"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -286,7 +288,7 @@ func TestTrainSemanticSimilarityGo(t *testing.T) {
 		t.SkipNow()
 	}
 
-	dataset, err := datasets.NewSemanticSimilarityDataset("./testData/semanticSimilarityTest.jsonl", 1, nil)
+	dataset, err := datasets.NewSemanticSimilarityDataset("./testcases/semanticSimilarityTest.jsonl", 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -316,12 +318,12 @@ func TestTrainSemanticSimilarityGo(t *testing.T) {
 	if e := session.Save("./models/testTrain"); e != nil {
 		t.Fatal(e)
 	}
-	if exists, existsErr := util.FileExists("./models/testTrain"); existsErr != nil {
+	if exists, existsErr := fileutil.FileExists("./models/testTrain"); existsErr != nil {
 		t.Fatal(err)
 	} else if !exists {
 		t.Fatal("model file ./models/testTrain does not exist")
 	}
-	if err = util.DeleteFile("./models/testTrain"); err != nil {
+	if err = fileutil.DeleteFile("./models/testTrain"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -329,11 +331,11 @@ func TestTrainSemanticSimilarityGo(t *testing.T) {
 func TestEarlyStopping(t *testing.T) {
 	modelPath := "./models/KnightsAnalytics_all-MiniLM-L6-v2"
 
-	trainDataset, err := datasets.NewSemanticSimilarityDataset("./testData/semanticSimilarityTest.jsonl", 1, nil)
+	trainDataset, err := datasets.NewSemanticSimilarityDataset("./testcases/semanticSimilarityTest.jsonl", 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	evalDataset, err := datasets.NewSemanticSimilarityDataset("./testData/semanticSimilarityTestEval.jsonl", 1, nil)
+	evalDataset, err := datasets.NewSemanticSimilarityDataset("./testcases/semanticSimilarityTestEval.jsonl", 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
