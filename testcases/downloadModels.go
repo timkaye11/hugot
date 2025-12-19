@@ -33,6 +33,8 @@ var models = []downloadModel{
 	{name: "KnightsAnalytics/Phi-3.5-mini-instruct-onnx", onnxFilePath: "phi-3.5-mini-instruct-cpu-int4-awq-block-128-acc-level-4.onnx", externalDataPath: "phi-3.5-mini-instruct-cpu-int4-awq-block-128-acc-level-4.onnx.data"},
 	// Gemma 3 model for text generation testing - uses onnx-community pre-converted model
 	{name: "onnx-community/gemma-3-1b-it-ONNX", onnxFilePath: "onnx/model.onnx"},
+	// BERT-base NER model - Xenova's ONNX conversion of dslim/bert-base-NER
+	{name: "Xenova/bert-base-NER", onnxFilePath: "onnx/model.onnx"},
 }
 
 // Additional files to download (direct URLs).

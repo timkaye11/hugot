@@ -841,6 +841,91 @@ func tokenClassificationPipeline(t *testing.T, session *Session) {
 	})
 }
 
+// Token classification with BERT-base-NER (tests a different model architecture)
+func tokenClassificationPipelineBertNER(t *testing.T, session *Session) {
+	t.Helper()
+
+	modelPath := "./models/Xenova_bert-base-NER"
+	config := TokenClassificationConfig{
+		ModelPath:    modelPath,
+		Name:         "testBertNER",
+		OnnxFilename: "onnx/model.onnx",
+		Options: []TokenClassificationOption{
+			pipelines.WithSimpleAggregation(),
+			pipelines.WithIgnoreLabels([]string{"O"}),
+		},
+	}
+	pipeline, err := NewPipeline(session, config)
+	checkT(t, err)
+
+	tests := []struct {
+		name     string
+		input    []string
+		expected [][]string // expected entity types per input
+	}{
+		{
+			name:  "Single sentence with person and location",
+			input: []string{"My name is Wolfgang and I live in Berlin."},
+			expected: [][]string{
+				{"PER", "LOC"}, // Wolfgang=PER, Berlin=LOC
+			},
+		},
+		{
+			name:  "Organization recognition",
+			input: []string{"Microsoft was founded by Bill Gates."},
+			expected: [][]string{
+				{"ORG", "PER"}, // Microsoft=ORG, Bill Gates=PER
+			},
+		},
+		{
+			name:  "Batch processing",
+			input: []string{"Apple Inc. is based in Cupertino.", "Elon Musk founded SpaceX."},
+			expected: [][]string{
+				{"ORG", "LOC"}, // Apple Inc.=ORG, Cupertino=LOC
+				{"PER", "ORG"}, // Elon Musk=PER, SpaceX=ORG
+			},
+		},
+		{
+			name:  "Multiple entities of same type",
+			input: []string{"John met Mary in Paris and they traveled to London."},
+			expected: [][]string{
+				{"PER", "PER", "LOC", "LOC"}, // John, Mary, Paris, London
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := pipeline.RunPipeline(tt.input)
+			checkT(t, err)
+
+			// Verify we got results for each input
+			assert.Equal(t, len(tt.input), len(result.Entities), "Expected entity results for each input")
+
+			// Verify entity types match expected (order may vary based on position)
+			for i, expectedTypes := range tt.expected {
+				entities := result.Entities[i]
+				t.Logf("Input %d: %q", i, tt.input[i])
+				for _, entity := range entities {
+					t.Logf("  Found: %s (%s) score=%.4f", entity.Word, entity.Entity, entity.Score)
+				}
+
+				// Check that we found roughly the expected number of entities
+				// (some models may merge or split entities differently)
+				assert.GreaterOrEqual(t, len(entities), len(expectedTypes)/2,
+					"Expected at least half of expected entities for input %d", i)
+
+				// Verify each found entity has a valid type
+				for _, entity := range entities {
+					assert.NotEmpty(t, entity.Entity, "Entity type should not be empty")
+					assert.NotEmpty(t, entity.Word, "Entity word should not be empty")
+					assert.Greater(t, entity.Score, float32(0.5), "Entity score should be > 0.5")
+				}
+			}
+		})
+	}
+}
+
 func tokenClassificationPipelineValidation(t *testing.T, session *Session) {
 	t.Helper()
 

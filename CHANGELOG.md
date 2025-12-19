@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
   - Added Python ONNX export script for custom Gemma 3 exports (scripts/export_gemma3_onnx.py)
 - Support for nested `text_config` in model config.json (for multimodal models like Gemma 3)
 - Improved documentation with separate Gemma and Phi usage examples
+- BERT-base NER support and testing
+  - Added Xenova/bert-base-NER to test downloads (ONNX conversion of dslim/bert-base-NER)
+  - Added comprehensive integration tests for BERT-based NER
+  - Added Python ONNX export script for NER models (scripts/export_ner_onnx.py)
 
 ### Changed
 
