@@ -31,6 +31,8 @@ var models = []downloadModel{
 	{name: "KnightsAnalytics/resnet50"},
 	{name: "KnightsAnalytics/detr-resnet-50", onnxFilePath: "model.onnx"},
 	{name: "KnightsAnalytics/Phi-3.5-mini-instruct-onnx", onnxFilePath: "phi-3.5-mini-instruct-cpu-int4-awq-block-128-acc-level-4.onnx", externalDataPath: "phi-3.5-mini-instruct-cpu-int4-awq-block-128-acc-level-4.onnx.data"},
+	// Gemma 3 model for text generation testing - uses onnx-community pre-converted model
+	{name: "onnx-community/gemma-3-1b-it-ONNX", onnxFilePath: "onnx/model.onnx"},
 }
 
 // Additional files to download (direct URLs).
@@ -50,8 +52,10 @@ func main() {
 			}
 		}
 		for _, model := range models {
-			if os.Getenv("CI") != "" && model.name == "KnightsAnalytics/Phi-3.5-mini-instruct-onnx" {
-				continue // skipping this model for cicd
+			// Skip large generative models in CI
+			if os.Getenv("CI") != "" && (model.name == "KnightsAnalytics/Phi-3.5-mini-instruct-onnx" ||
+				model.name == "onnx-community/gemma-3-1b-it-ONNX") {
+				continue // skipping large models for cicd
 			}
 
 			if ok, err = fileutil.FileExists("./models/" + strings.ReplaceAll(model.name, "/", "_")); err == nil {

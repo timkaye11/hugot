@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## [0.6.0] 🌲❄️🎄🎁 - 2025-12-18
 
+### Added
+
+- Enhanced Gemma 3 support for TextGenerationPipeline
+  - Added test coverage for Gemma 3 models (onnx-community/gemma-3-1b-it-ONNX)
+  - Added Gemma 3 model to test downloads
+  - Added Python ONNX export script for custom Gemma 3 exports (scripts/export_gemma3_onnx.py)
+- Support for nested `text_config` in model config.json (for multimodal models like Gemma 3)
+- Improved documentation with separate Gemma and Phi usage examples
+
 ### Changed
 
 - Integrated [ONNX Runtime GenAI](https://github.com/microsoft/onnxruntime-genai) backend for significantly faster generative inference and broad model support.
@@ -18,7 +27,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 - ORT Gen AI has strong requirements on the name of the base ORT library. It should not be renamed from the release zip (e.g. libonnxruntime.so)
 - WithOnnxLibraryPath should now be the folder contining the ORT library. The library name is now inferred from the current operating system.
-- XLA now uses go-xla to manage PJRT dependencies, see our [Dockerfile](./Dockerfile) for details 
+- XLA now uses go-xla to manage PJRT dependencies, see our [Dockerfile](./Dockerfile) for details
 
 ### Fixed
 
@@ -90,7 +99,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Changed
 
-- Apply small input performance fix to goMLX backend 
+- Apply small input performance fix to goMLX backend
 
 ## [0.5.1] - 2025-08-29
 
@@ -133,7 +142,7 @@ over the line!
 ### Changed
 
 - Upgraded to latest Rust and Go tokenizers
-- Generalised output tensor types, added int64 support (preparation for text generation pipeline) 
+- Generalised output tensor types, added int64 support (preparation for text generation pipeline)
 - Dependency updates and go 1.24.5
 
 ## [0.4.2] - 2025-06-26

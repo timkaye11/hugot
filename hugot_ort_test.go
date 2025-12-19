@@ -354,7 +354,42 @@ func TestTextGenerationPipelineValidationORT(t *testing.T) {
 	textGenerationPipelineValidation(t, session)
 }
 
-// No same name
+// Gemma 3 Text Generation
+
+func TestTextGenerationPipelineGemma3ORT(t *testing.T) {
+	if os.Getenv("CI") != "" {
+		t.SkipNow()
+	}
+	opts := []options.WithOption{options.WithOnnxLibraryPath(onnxRuntimeSharedLibrary)}
+	session, err := NewORTSession(opts...)
+	checkT(t, err)
+	defer func(session *Session) {
+		destroyErr := session.Destroy()
+		checkT(t, destroyErr)
+	}(session)
+	textGenerationPipelineGemma3(t, session)
+}
+
+func TestTextGenerationPipelineGemma3ORTCuda(t *testing.T) {
+	if os.Getenv("CI") != "" {
+		t.SkipNow()
+	}
+	opts := []options.WithOption{
+		options.WithOnnxLibraryPath("/usr/lib64/onnxruntime-gpu/libonnxruntime.so"),
+		options.WithCuda(map[string]string{
+			"device_id": "0",
+		}),
+	}
+	session, err := NewORTSession(opts...)
+	checkT(t, err)
+	defer func(session *Session) {
+		destroyErr := session.Destroy()
+		checkT(t, destroyErr)
+	}(session)
+	textGenerationPipelineGemma3(t, session)
+}
+
+// No Same Name
 
 func TestNoSameNamePipelineORT(t *testing.T) {
 	session, err := NewORTSession()

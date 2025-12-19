@@ -162,11 +162,21 @@ func loadModelConfig(model *Model) error {
 		if readErr != nil {
 			return readErr
 		}
-		if maxPositionEmbeddingsRaw, existsOk := configMap["max_position_embeddings"]; existsOk {
+
+		// For multimodal models like Gemma3, the text model config may be nested under "text_config"
+		// Check if text_config exists and use it for text-related parameters
+		textConfig := configMap
+		if tc, ok := configMap["text_config"].(map[string]any); ok {
+			textConfig = tc
+		}
+
+		if maxPositionEmbeddingsRaw, existsOk := textConfig["max_position_embeddings"]; existsOk {
 			if maxPositionEmbeddings, castOk := maxPositionEmbeddingsRaw.(float64); castOk {
 				model.MaxPositionEmbeddings = int(maxPositionEmbeddings)
 			}
 		}
+
+		// pad_token_id and eos_token_id are typically at the root level
 		if padTokenRaw, existsOk := configMap["pad_token_id"]; existsOk {
 			if padToken, castOk := padTokenRaw.(float64); castOk {
 				model.PadToken = int64(padToken)
@@ -187,7 +197,13 @@ func loadModelConfig(model *Model) error {
 				return fmt.Errorf("id2label is not a map")
 			}
 		}
-		if eosRaw, exists := configMap["eos_token_id"]; exists {
+
+		// eos_token_id can be at root level or in text_config
+		eosRaw, eosExists := configMap["eos_token_id"]
+		if !eosExists {
+			eosRaw, eosExists = textConfig["eos_token_id"]
+		}
+		if eosExists {
 			model.EosTokenIDs = map[int64]bool{}
 			switch v := eosRaw.(type) {
 			case []any:
@@ -204,28 +220,33 @@ func loadModelConfig(model *Model) error {
 				return errors.New("eos_token_id must be either a number or an array of numbers")
 			}
 		}
-		if numHiddenLayersRaw, exists := configMap["num_hidden_layers"]; exists {
+
+		// Model architecture parameters - check textConfig first, then root
+		if numHiddenLayersRaw, exists := textConfig["num_hidden_layers"]; exists {
 			if numHiddenLayersFloat, ok := numHiddenLayersRaw.(float64); ok {
 				model.NumHiddenLayers = int(numHiddenLayersFloat)
 			} else {
 				return errors.New("num_hidden_layers is not a number")
 			}
 		}
-		if numKeyValueHeads, exists := configMap["num_key_value_heads"]; exists {
+
+		if numKeyValueHeads, exists := textConfig["num_key_value_heads"]; exists {
 			if numKeyValueHeadsValue, ok := numKeyValueHeads.(float64); ok {
 				model.NumKeyValueHeads = int(numKeyValueHeadsValue)
 			} else {
 				return errors.New("num_key_value_heads is not a number")
 			}
 		}
-		if headDim, exists := configMap["head_dim"]; exists {
+
+		if headDim, exists := textConfig["head_dim"]; exists {
 			if headDimValue, ok := headDim.(float64); ok {
 				model.HeadDim = int(headDimValue)
 			} else {
-				return errors.New("num_key_value_heads is not a number")
+				return errors.New("head_dim is not a number")
 			}
 		}
-		if vocabSize, exists := configMap["vocab_size"]; exists {
+
+		if vocabSize, exists := textConfig["vocab_size"]; exists {
 			if vocabSizeValue, ok := vocabSize.(float64); ok {
 				model.VocabSize = int(vocabSizeValue)
 			} else {

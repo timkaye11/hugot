@@ -1186,7 +1186,7 @@ func destroyPipelines(t *testing.T, session *Session) {
 	}
 }
 
-// Text Generation.
+// Text Generation (Phi)
 func textGenerationPipeline(t *testing.T, session *Session) {
 	t.Helper()
 
@@ -1323,6 +1323,82 @@ func textGenerationPipelineValidation(t *testing.T, session *Session) {
 	pipeline.MaxLength = -100
 	err = pipeline.Validate()
 	assert.Error(t, err)
+}
+
+// Text Generation (Gemma 3)
+func textGenerationPipelineGemma3(t *testing.T, session *Session) {
+	t.Helper()
+
+	defer func(session *Session) {
+		err := session.Destroy()
+		checkT(t, err)
+	}(session)
+
+	// Configure the Gemma 3 text generation pipeline
+	config := TextGenerationConfig{
+		ModelPath:    "./models/onnx-community_gemma-3-1b-it-ONNX",
+		Name:         "testGemma3Pipeline",
+		OnnxFilename: "onnx/model.onnx",
+		Options: []pipelineBackends.PipelineOption[*pipelines.TextGenerationPipeline]{
+			pipelines.WithMaxTokens(100),
+			pipelines.WithGemmaTemplate(),
+		},
+	}
+
+	// Create the pipeline
+	gemmaPipeline, err := NewPipeline(session, config)
+	checkT(t, err)
+
+	tests := []struct {
+		name  string
+		input [][]pipelines.Message
+	}{
+		{
+			name: "basic Gemma3 test",
+			input: [][]pipelines.Message{
+				{
+					{Role: "user", Content: "What is 2+2?"},
+				},
+			},
+		},
+		{
+			name: "Gemma3 with system message",
+			input: [][]pipelines.Message{
+				{
+					{Role: "system", Content: "You are a helpful assistant."},
+					{Role: "user", Content: "What is the capital of France?"},
+				},
+			},
+		},
+		{
+			name: "Gemma3 batched input",
+			input: [][]pipelines.Message{
+				{
+					{Role: "user", Content: "What is 2+2?"},
+				},
+				{
+					{Role: "user", Content: "What is the capital of Italy?"},
+				},
+			},
+		},
+	}
+
+	// Execute tests
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			batchResult, err := gemmaPipeline.RunWithTemplate(tt.input)
+			checkT(t, err)
+			outputStrings := batchResult.GetOutput()
+			// Verify we got outputs for all inputs
+			assert.Equal(t, len(tt.input), len(outputStrings), "Expected output count to match input count")
+			// Verify each output is non-empty
+			for i, output := range outputStrings {
+				generatedString := output.(string)
+				assert.NotEmpty(t, generatedString, "Expected non-empty generated text for input %d", i)
+				t.Logf("Input %d generated: %s", i, generatedString[:min(100, len(generatedString))])
+			}
+		})
+	}
 }
 
 // Thread safety
