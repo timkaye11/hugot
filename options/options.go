@@ -62,6 +62,11 @@ type GoMLXOptions struct {
 	Cuda bool
 	XLA  bool
 	TPU  bool
+	// MaxDynamicBounds specifies maximum bounds for dynamic dimensions.
+	// Used when ONNX operations like ConstantOfShape have data-dependent shapes
+	// that cannot be materialized at compile time.
+	// Key is dimension name (e.g., "batch_size", "sequence", "*" for default).
+	MaxDynamicBounds map[string]int
 	// BatchBuckets defines the bucket sizes for batch dimension padding.
 	// Coarse bucketing reduces JIT cache pressure by limiting unique shapes.
 	// Default: []int{1, 8, 32}
@@ -318,6 +323,33 @@ func WithTensorRT(options map[string]string) WithOption {
 			return nil
 		}
 		return fmt.Errorf("WithTensorRT is only supported for ORT backend")
+	}
+}
+
+// WithMaxDynamicBounds (Go/XLA only) sets maximum bounds for dynamic dimensions.
+// This is used when ONNX operations like ConstantOfShape have data-dependent shapes
+// that cannot be materialized at compile time. Instead of failing, the operation
+// will use the specified maximum bound to create a statically-shaped tensor.
+//
+// The bounds map uses dimension names as keys (from the ONNX model's dynamic shape names).
+// Use "*" as a key to set a default fallback for any unnamed or unspecified dimensions.
+//
+// Example:
+//
+//	WithMaxDynamicBounds(map[string]int{
+//	    "batch_size": 32,
+//	    "sequence":   512,
+//	    "*":          256,  // default fallback
+//	})
+func WithMaxDynamicBounds(bounds map[string]int) WithOption {
+	return func(o *Options) error {
+		switch o.Backend {
+		case "GO", "XLA":
+			o.GoMLXOptions.MaxDynamicBounds = bounds
+			return nil
+		default:
+			return fmt.Errorf("WithMaxDynamicBounds is only supported for GO or XLA backends")
+		}
 	}
 }
 

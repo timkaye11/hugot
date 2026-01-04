@@ -44,6 +44,12 @@ func getRustTokenizerOptions(inputs []InputOutputInfo) ([]tokenizers.EncodeOptio
 			encodeOptions = append(encodeOptions, tokenizers.WithReturnAttentionMask())
 		case "position_ids":
 			continue
+		// Image model inputs - handled by the image pipeline
+		case "pixel_values":
+			continue
+		// GLiNER-specific inputs - handled by the GLiNER pipeline
+		case "words_mask", "text_lengths", "span_idx", "span_mask":
+			continue
 		default:
 			// Skip inputs that are handled at the model level
 			lowerName := strings.ToLower(input.Name)

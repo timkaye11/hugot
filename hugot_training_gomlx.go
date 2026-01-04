@@ -1,3 +1,5 @@
+//go:build XLA || ALL
+
 package hugot
 
 import (

@@ -1,3 +1,5 @@
+//go:build XLA || ALL
+
 package backends
 
 import (
@@ -91,6 +93,11 @@ func createGoMLXModelBackend(model *Model, options *options.Options) error {
 	modelParsed, err := onnx.Parse(model.OnnxBytes)
 	if err != nil {
 		return err
+	}
+
+	// Apply MaxDynamicBounds if configured for handling data-dependent shapes
+	if options.GoMLXOptions != nil && options.GoMLXOptions.MaxDynamicBounds != nil {
+		modelParsed.WithMaxDynamicBounds(options.GoMLXOptions.MaxDynamicBounds)
 	}
 
 	inputs, outputs := loadInputOutputMetaGoMLX(modelParsed)
@@ -232,17 +239,37 @@ func createInputTensorsGoMLX(batch *PipelineBatch, model *Model, padBatchDimensi
 
 	var err error
 	batchSize := batch.Size
-	if padBatchDimension {
-		batchSize, err = shapeBucket(batchSize, model.GoMLXModel.BatchBuckets)
-		if err != nil {
-			return fmt.Errorf("batch size larger than max bucket, please adjust WithGoMLXBatchBuckets: %w", err)
-		}
-	}
 	maxSeqLength := batch.MaxSequenceLength
-	if padSequenceDimension && !leftPad {
-		maxSeqLength, err = shapeBucket(maxSeqLength, model.GoMLXModel.SequenceBuckets)
-		if err != nil {
-			return fmt.Errorf("sequence length larger than max bucket, please adjust WithGoMLXSequenceBuckets: %w", err)
+
+	// Check if model has fixed input shapes. Models exported with no_dynamic_axes=True
+	// (e.g., via Optimum) have positive dimension values and require inputs padded to
+	// exact dimensions. Dynamic models use -1 to indicate variable dimensions.
+	fixedShape := GetFixedShapeFromInputs(model.InputsMeta)
+	if fixedShape.HasFixedShape {
+		// Validate that input doesn't exceed fixed dimensions
+		if batch.Size > fixedShape.BatchSize {
+			return fmt.Errorf("batch size %d exceeds model's fixed batch size %d",
+				batch.Size, fixedShape.BatchSize)
+		}
+		if batch.MaxSequenceLength > fixedShape.SequenceLength {
+			return fmt.Errorf("input sequence length %d exceeds model's fixed sequence length %d",
+				batch.MaxSequenceLength, fixedShape.SequenceLength)
+		}
+		batchSize = fixedShape.BatchSize
+		maxSeqLength = fixedShape.SequenceLength
+	} else {
+		// Dynamic shape model: apply bucket-based padding for efficiency
+		if padBatchDimension {
+			batchSize, err = shapeBucket(batchSize, model.GoMLXModel.BatchBuckets)
+			if err != nil {
+				return fmt.Errorf("batch size larger than max bucket, please adjust WithGoMLXBatchBuckets: %w", err)
+			}
+		}
+		if padSequenceDimension && !leftPad {
+			maxSeqLength, err = shapeBucket(maxSeqLength, model.GoMLXModel.SequenceBuckets)
+			if err != nil {
+				return fmt.Errorf("sequence length larger than max bucket, please adjust WithGoMLXSequenceBuckets: %w", err)
+			}
 		}
 	}
 	total := batchSize * maxSeqLength

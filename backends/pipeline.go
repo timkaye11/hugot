@@ -46,6 +46,39 @@ func NewShape(dimensions ...int64) Shape {
 	return dimensions
 }
 
+// FixedShapeInfo contains the fixed dimensions for models exported with static shapes.
+// Models exported with no_dynamic_axes=True (e.g., via Optimum) have positive dimension
+// values, while dynamic models use -1 or 0 to indicate variable dimensions.
+type FixedShapeInfo struct {
+	BatchSize     int
+	SequenceLength int
+	HasFixedShape bool
+}
+
+// GetFixedShapeFromInputs examines model input metadata to detect fixed-shape models.
+// It looks for the "input_ids" input (standard for transformer models) and checks if
+// both batch and sequence dimensions are positive (indicating fixed shapes).
+//
+// Returns FixedShapeInfo with HasFixedShape=true if the model requires fixed dimensions,
+// otherwise returns HasFixedShape=false and the caller should use dynamic sizing.
+func GetFixedShapeFromInputs(inputs []InputOutputInfo) FixedShapeInfo {
+	for _, meta := range inputs {
+		if meta.Name == "input_ids" && len(meta.Dimensions) >= 2 {
+			batchDim := meta.Dimensions[0]
+			seqDim := meta.Dimensions[1]
+			// Positive dimensions indicate fixed shapes; -1 or 0 indicate dynamic
+			if batchDim > 0 && seqDim > 0 {
+				return FixedShapeInfo{
+					BatchSize:      int(batchDim),
+					SequenceLength: int(seqDim),
+					HasFixedShape:  true,
+				}
+			}
+		}
+	}
+	return FixedShapeInfo{HasFixedShape: false}
+}
+
 type OutputInfo struct {
 	Name       string
 	Dimensions []int64
@@ -142,29 +175,16 @@ type PipelineBatch struct {
 	Size              int
 	MaxSequenceLength int
 	MaxNewTokens      int
-	// Multimodal support
-	MultimodalTensors any // Will hold *ortgenai.NamedTensors for ORT backend
-	DestroyMultimodal func() error
 }
 
 func (b *PipelineBatch) Destroy() error {
-	var err error
-	if b.DestroyInputs != nil {
-		err = errors.Join(err, b.DestroyInputs())
-	}
-	if b.DestroyMultimodal != nil {
-		err = errors.Join(err, b.DestroyMultimodal())
-	}
-	return err
+	return b.DestroyInputs()
 }
 
 // NewBatch initializes a new batch for inference.
 func NewBatch(size int) *PipelineBatch {
 	return &PipelineBatch{
 		DestroyInputs: func() error {
-			return nil
-		},
-		DestroyMultimodal: func() error {
 			return nil
 		},
 		Size: size,
