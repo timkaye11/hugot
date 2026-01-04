@@ -235,6 +235,8 @@ func runSeq2SeqGenerationORT(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipeli
 			encoderPKV, decoderPKV = splitEncoderDecoderPKV(allPKV, decoderInitModel)
 		} else {
 			// Subsequent steps: use decoder with past_key_values
+			// combinedPKV reorders encoderPKV and decoderPKV into the order expected by decoder.
+			// It contains references to the same tensors, not copies.
 			combinedPKV, combineErr := combineEncoderDecoderPKV(encoderPKV, decoderPKV, decoderModel)
 			if combineErr != nil {
 				// Cleanup on error
@@ -253,7 +255,9 @@ func runSeq2SeqGenerationORT(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipeli
 				combinedPKV, decoderModel, batchSize, vocabSize, step, encoderSeqLen,
 			)
 			if err != nil {
-				// Cleanup on error
+				// Cleanup on error: destroy encoderPKV and decoderPKV.
+				// Note: combinedPKV contains references to the same tensors (it's just a reordering),
+				// so we must NOT destroy it separately to avoid double-free.
 				for _, pkv := range encoderPKV {
 					pkv.Destroy()
 				}
