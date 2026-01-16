@@ -76,9 +76,12 @@ func RunSeq2SeqEncoder(batch Seq2SeqBatchInterface, model *Model, runtime string
 	batch.SetEncoderAttentionMask(attentionMaskTensor)
 
 	// Set cleanup function for encoder outputs
+	// NOTE: attentionMaskTensor is stored in batch and used by decoder,
+	// so it must be cleaned up here along with other encoder resources
 	batch.SetDestroyEncoder(func() error {
 		var errs []error
 		errs = append(errs, inputIDsTensor.FinalizeAll())
+		errs = append(errs, attentionMaskTensor.FinalizeAll()) // Fix: was leaking
 		for _, out := range outputs {
 			errs = append(errs, out.FinalizeAll())
 		}
@@ -125,9 +128,24 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 	finished := make([]bool, batchSize)
 	finishedCount := 0
 
-	// Get encoder outputs
-	encoderHiddenStates := batch.GetEncoderHiddenStates().(*tensors.Tensor)
-	encoderAttentionMask := batch.GetEncoderAttentionMask().(*tensors.Tensor)
+	// Get encoder outputs with nil checks
+	encoderHiddenStatesAny := batch.GetEncoderHiddenStates()
+	if encoderHiddenStatesAny == nil {
+		return errors.New("encoder hidden states not set - was Encode() called?")
+	}
+	encoderHiddenStates, ok := encoderHiddenStatesAny.(*tensors.Tensor)
+	if !ok {
+		return fmt.Errorf("encoder hidden states has unexpected type %T", encoderHiddenStatesAny)
+	}
+
+	encoderAttentionMaskAny := batch.GetEncoderAttentionMask()
+	if encoderAttentionMaskAny == nil {
+		return errors.New("encoder attention mask not set - was Encode() called?")
+	}
+	encoderAttentionMask, ok := encoderAttentionMaskAny.(*tensors.Tensor)
+	if !ok {
+		return fmt.Errorf("encoder attention mask has unexpected type %T", encoderAttentionMaskAny)
+	}
 
 	// Initialize decoder input with start token
 	currentIDs := make([]int64, batchSize)
@@ -140,6 +158,25 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 	// decoderPKV gets updated each step (self-attention KV)
 	var encoderPKV []*tensors.Tensor
 	var decoderPKV []*tensors.Tensor
+
+	// Set cleanup function BEFORE generation loop to ensure cleanup on any error path
+	// The cleanup function safely handles nil slices and nil tensors
+	batch.SetDestroyDecoder(func() error {
+		var errs []error
+		// Clean up encoder PKV (cross-attention, constant throughout generation)
+		for _, kv := range encoderPKV {
+			if kv != nil {
+				errs = append(errs, kv.FinalizeAll())
+			}
+		}
+		// Clean up decoder PKV (self-attention, updated each step)
+		for _, kv := range decoderPKV {
+			if kv != nil {
+				errs = append(errs, kv.FinalizeAll())
+			}
+		}
+		return errors.Join(errs...)
+	})
 
 	// Generation loop
 	for step := 0; step < maxNewTokens && finishedCount < batchSize; step++ {
@@ -263,24 +300,7 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 	batch.SetFinished(finished)
 	batch.SetFinishedCount(finishedCount)
 
-	// Set cleanup function for decoder resources
-	batch.SetDestroyDecoder(func() error {
-		var errs []error
-		// Clean up encoder PKV (cross-attention, constant throughout generation)
-		for _, kv := range encoderPKV {
-			if kv != nil {
-				errs = append(errs, kv.FinalizeAll())
-			}
-		}
-		// Clean up decoder PKV (self-attention, updated each step)
-		for _, kv := range decoderPKV {
-			if kv != nil {
-				errs = append(errs, kv.FinalizeAll())
-			}
-		}
-		return errors.Join(errs...)
-	})
-
+	// Cleanup function was already set before the loop to handle error paths
 	return nil
 }
 

@@ -105,7 +105,8 @@ func runSeq2SeqEncoderORT(batch Seq2SeqBatchInterface, model *Model) error {
 
 // tokenSelector is a function type for selecting the next token from logits.
 // This allows the generation loop to be reused for both greedy and sampling strategies.
-type tokenSelector func(logits []float32, batchSize, vocabSize int) []int64
+// Returns an error if the logits buffer is invalid.
+type tokenSelector func(logits []float32, batchSize, vocabSize int) ([]int64, error)
 
 // RunSeq2SeqGenerationGreedy performs greedy decoding.
 func RunSeq2SeqGenerationGreedy(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipelineInterface) error {
@@ -114,7 +115,7 @@ func RunSeq2SeqGenerationGreedy(batch Seq2SeqBatchInterface, pipeline Seq2SeqPip
 	}
 
 	// Greedy selection: argmax over vocabulary
-	selector := func(logits []float32, batchSize, vocabSize int) []int64 {
+	selector := func(logits []float32, batchSize, vocabSize int) ([]int64, error) {
 		return argmaxSeq2Seq(logits, batchSize, vocabSize)
 	}
 
@@ -131,7 +132,7 @@ func RunSeq2SeqGenerationSampling(batch Seq2SeqBatchInterface, pipeline Seq2SeqP
 	temperature := pipeline.GetTemperature()
 
 	// Sampling selection: top-p with temperature
-	selector := func(logits []float32, batchSize, vocabSize int) []int64 {
+	selector := func(logits []float32, batchSize, vocabSize int) ([]int64, error) {
 		return sampleTopP(logits, batchSize, vocabSize, topP, temperature)
 	}
 
@@ -155,9 +156,24 @@ func runSeq2SeqGenerationORT(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipeli
 		generatedTokens[i] = []int64{}
 	}
 
-	// Get encoder outputs
-	encoderHiddenStates := batch.GetEncoderHiddenStates().(ort.Value)
-	encoderAttentionMask := batch.GetEncoderAttentionMask().(ort.Value)
+	// Get encoder outputs with nil checks
+	encoderHiddenStatesAny := batch.GetEncoderHiddenStates()
+	if encoderHiddenStatesAny == nil {
+		return errors.New("encoder hidden states not set - was Encode() called?")
+	}
+	encoderHiddenStates, ok := encoderHiddenStatesAny.(ort.Value)
+	if !ok {
+		return fmt.Errorf("encoder hidden states has unexpected type %T", encoderHiddenStatesAny)
+	}
+
+	encoderAttentionMaskAny := batch.GetEncoderAttentionMask()
+	if encoderAttentionMaskAny == nil {
+		return errors.New("encoder attention mask not set - was Encode() called?")
+	}
+	encoderAttentionMask, ok := encoderAttentionMaskAny.(ort.Value)
+	if !ok {
+		return fmt.Errorf("encoder attention mask has unexpected type %T", encoderAttentionMaskAny)
+	}
 
 	// First step: use decoder-init (no past_key_values)
 	decoderInputIDs := make([]int64, batchSize)
@@ -177,6 +193,30 @@ func runSeq2SeqGenerationORT(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipeli
 	var decoderPKV []ort.Value // Self-attention KV (updated each step)
 
 	encoderSeqLen := batch.GetMaxInputLength()
+
+	// Set cleanup function BEFORE generation loop to ensure cleanup on any error path.
+	// This also handles encoder outputs cleanup which was previously missing.
+	batch.SetDestroyDecoder(func() error {
+		var errs []error
+		for _, pkv := range encoderPKV {
+			if pkv != nil {
+				errs = append(errs, pkv.Destroy())
+			}
+		}
+		for _, pkv := range decoderPKV {
+			if pkv != nil {
+				errs = append(errs, pkv.Destroy())
+			}
+		}
+		// Also destroy encoder outputs now (Fix: was leaking on decoder errors)
+		if hs, ok := batch.GetEncoderHiddenStates().(ort.Value); ok && hs != nil {
+			errs = append(errs, hs.Destroy())
+		}
+		if am, ok := batch.GetEncoderAttentionMask().(ort.Value); ok && am != nil {
+			errs = append(errs, am.Destroy())
+		}
+		return errors.Join(errs...)
+	})
 
 	for step := 0; step < maxNewTokens; step++ {
 		if finishedCount == batchSize {
@@ -227,7 +267,17 @@ func runSeq2SeqGenerationORT(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipeli
 		}
 
 		// Select next tokens using the provided strategy (greedy or sampling)
-		nextTokens := selectTokens(logits, batchSize, vocabSize)
+		nextTokens, err := selectTokens(logits, batchSize, vocabSize)
+		if err != nil {
+			// Cleanup PKV on token selection error
+			for _, pkv := range encoderPKV {
+				pkv.Destroy()
+			}
+			for _, pkv := range decoderPKV {
+				pkv.Destroy()
+			}
+			return fmt.Errorf("token selection at step %d: %w", step, err)
+		}
 
 		// Update decoder input for next step
 		decoderInputIDs = nextTokens
@@ -253,24 +303,7 @@ func runSeq2SeqGenerationORT(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipeli
 	batch.SetFinished(finished)
 	batch.SetFinishedCount(finishedCount)
 
-	// Set cleanup for decoder resources
-	batch.SetDestroyDecoder(func() error {
-		var errs []error
-		for _, pkv := range encoderPKV {
-			errs = append(errs, pkv.Destroy())
-		}
-		for _, pkv := range decoderPKV {
-			errs = append(errs, pkv.Destroy())
-		}
-		// Also destroy encoder outputs now
-		if hs, ok := batch.GetEncoderHiddenStates().(ort.Value); ok {
-			errs = append(errs, hs.Destroy())
-		}
-		if am, ok := batch.GetEncoderAttentionMask().(ort.Value); ok {
-			errs = append(errs, am.Destroy())
-		}
-		return errors.Join(errs...)
-	})
+	// Cleanup function was already set before the loop to handle error paths
 
 	return nil
 }
@@ -333,14 +366,18 @@ func runDecoderInitStepORT(
 		return nil, nil, fmt.Errorf("running decoder-init: %w", err)
 	}
 
-	// Extract logits
-	logits := outputs[0].(*ort.Tensor[float32]).GetData()
+	// Extract logits - MUST copy before destroying tensor
+	// GetData() returns a reference to tensor's internal memory
+	logitsTensor := outputs[0].(*ort.Tensor[float32])
+	logitsRef := logitsTensor.GetData()
+	logits := make([]float32, len(logitsRef))
+	copy(logits, logitsRef)
 
 	// Keep past_key_values (don't destroy them)
 	pastKeyValues := outputs[1:]
 
-	// Destroy logits tensor (we copied the data)
-	outputs[0].Destroy()
+	// Now safe to destroy logits tensor since we copied the data
+	logitsTensor.Destroy()
 
 	return logits, pastKeyValues, nil
 }
@@ -407,13 +444,18 @@ func runDecoderStepORT(
 		return nil, nil, fmt.Errorf("running decoder: %w", err)
 	}
 
-	// Extract logits
-	logits := outputs[0].(*ort.Tensor[float32]).GetData()
+	// Extract logits - MUST copy before destroying tensor
+	// GetData() returns a reference to tensor's internal memory
+	logitsTensor := outputs[0].(*ort.Tensor[float32])
+	logitsRef := logitsTensor.GetData()
+	logits := make([]float32, len(logitsRef))
+	copy(logits, logitsRef)
 
 	// Keep present key values (decoder only, will be combined with encoder PKV later)
 	presentKeyValues := outputs[1:]
 
-	outputs[0].Destroy()
+	// Now safe to destroy logits tensor since we copied the data
+	logitsTensor.Destroy()
 
 	return logits, presentKeyValues, nil
 }
@@ -556,7 +598,14 @@ func combineEncoderDecoderPKV(encoderPKV, decoderPKV []ort.Value, decoderModel *
 }
 
 // argmaxSeq2Seq performs argmax over the last dimension of logits.
-func argmaxSeq2Seq(logits []float32, batchSize, vocabSize int) []int64 {
+// Returns an error if logits buffer is too small for the given batch/vocab size.
+func argmaxSeq2Seq(logits []float32, batchSize, vocabSize int) ([]int64, error) {
+	// Bounds check to prevent panic
+	requiredLen := batchSize * vocabSize
+	if len(logits) < requiredLen {
+		return nil, fmt.Errorf("logits buffer too small: need %d elements, have %d", requiredLen, len(logits))
+	}
+
 	tokens := make([]int64, batchSize)
 
 	for b := 0; b < batchSize; b++ {
@@ -574,12 +623,19 @@ func argmaxSeq2Seq(logits []float32, batchSize, vocabSize int) []int64 {
 		tokens[b] = int64(maxIdx)
 	}
 
-	return tokens
+	return tokens, nil
 }
 
 // sampleTopP performs nucleus (top-p) sampling with temperature.
 // Creates a thread-local RNG seeded with current time for non-deterministic sampling.
-func sampleTopP(logits []float32, batchSize, vocabSize int, topP, temperature float32) []int64 {
+// Returns an error if logits buffer is too small for the given batch/vocab size.
+func sampleTopP(logits []float32, batchSize, vocabSize int, topP, temperature float32) ([]int64, error) {
+	// Bounds check to prevent panic
+	requiredLen := batchSize * vocabSize
+	if len(logits) < requiredLen {
+		return nil, fmt.Errorf("logits buffer too small: need %d elements, have %d", requiredLen, len(logits))
+	}
+
 	tokens := make([]int64, batchSize)
 
 	// Create a thread-local RNG for this sampling operation
@@ -647,5 +703,5 @@ func sampleTopP(logits []float32, batchSize, vocabSize int, topP, temperature fl
 		tokens[b] = int64(selectedIdx)
 	}
 
-	return tokens
+	return tokens, nil
 }
