@@ -89,7 +89,9 @@ func LoadModel(path string, onnxFilename string, options *options.Options, isGen
 			destroyErr = errors.Join(destroyErr, model.ORTModel.Destroy())
 			model.ORTModel = nil
 		case "GO", "XLA":
-			model.GoMLXModel.Destroy()
+			if model.GoMLXModel != nil {
+				model.GoMLXModel.Destroy()
+			}
 			model.GoMLXModel = nil
 		}
 		return destroyErr

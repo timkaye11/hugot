@@ -5,15 +5,10 @@ package backends
 import (
 	"errors"
 	"fmt"
-	"math/rand"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/gomlx/gomlx/pkg/core/dtypes"
 	"github.com/gomlx/gomlx/pkg/core/tensors"
-
-	"github.com/knights-analytics/hugot/util/vectorutil"
 )
 
 // RunSeq2SeqEncoder runs the encoder model on the input batch using GoMLX backend.
@@ -27,19 +22,8 @@ func RunSeq2SeqEncoder(batch Seq2SeqBatchInterface, model *Model, runtime string
 	inputAttentionMask := batch.GetInputAttentionMask()
 	maxLen := batch.GetMaxInputLength()
 
-	// Create input tensors
-	inputIDsFlat := make([]int64, batchSize*maxLen)
-	attentionMaskFlat := make([]int64, batchSize*maxLen)
-
-	for i := 0; i < batchSize; i++ {
-		for j := 0; j < maxLen; j++ {
-			idx := i*maxLen + j
-			if j < len(inputTokenIDs[i]) {
-				inputIDsFlat[idx] = inputTokenIDs[i][j]
-				attentionMaskFlat[idx] = inputAttentionMask[i][j]
-			}
-		}
-	}
+	// Create input tensors using shared utility
+	inputIDsFlat, attentionMaskFlat := Flatten2DInt64Pair(inputTokenIDs, inputAttentionMask, batchSize, maxLen)
 
 	inputIDsTensor := tensors.FromFlatDataAndDimensions(inputIDsFlat, batchSize, maxLen)
 	attentionMaskTensor := tensors.FromFlatDataAndDimensions(attentionMaskFlat, batchSize, maxLen)
@@ -52,8 +36,10 @@ func RunSeq2SeqEncoder(batch Seq2SeqBatchInterface, model *Model, runtime string
 		return fmt.Errorf("encoder execution failed: %w", err)
 	}
 
+	// inputIDsTensor is no longer needed after Exec() - finalize immediately to free memory
+	inputIDsTensor.FinalizeAll()
+
 	if len(outputs) == 0 {
-		inputIDsTensor.FinalizeAll()
 		attentionMaskTensor.FinalizeAll()
 		return errors.New("encoder returned no outputs")
 	}
@@ -61,13 +47,17 @@ func RunSeq2SeqEncoder(batch Seq2SeqBatchInterface, model *Model, runtime string
 	// Move encoder outputs to local storage so they can be used by decoder
 	// (which has a different backend instance)
 	if err := outputs[0].ToLocal(); err != nil {
-		inputIDsTensor.FinalizeAll()
 		attentionMaskTensor.FinalizeAll()
+		for _, out := range outputs {
+			out.FinalizeAll()
+		}
 		return fmt.Errorf("moving encoder hidden states to local: %w", err)
 	}
 	if err := attentionMaskTensor.ToLocal(); err != nil {
-		inputIDsTensor.FinalizeAll()
-		outputs[0].FinalizeAll()
+		attentionMaskTensor.FinalizeAll()
+		for _, out := range outputs {
+			out.FinalizeAll()
+		}
 		return fmt.Errorf("moving attention mask to local: %w", err)
 	}
 
@@ -76,9 +66,12 @@ func RunSeq2SeqEncoder(batch Seq2SeqBatchInterface, model *Model, runtime string
 	batch.SetEncoderAttentionMask(attentionMaskTensor)
 
 	// Set cleanup function for encoder outputs
+	// NOTE: attentionMaskTensor is stored in batch and used by decoder,
+	// so it must be cleaned up here along with other encoder resources
+	// inputIDsTensor already finalized above
 	batch.SetDestroyEncoder(func() error {
 		var errs []error
-		errs = append(errs, inputIDsTensor.FinalizeAll())
+		errs = append(errs, attentionMaskTensor.FinalizeAll())
 		for _, out := range outputs {
 			errs = append(errs, out.FinalizeAll())
 		}
@@ -125,9 +118,24 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 	finished := make([]bool, batchSize)
 	finishedCount := 0
 
-	// Get encoder outputs
-	encoderHiddenStates := batch.GetEncoderHiddenStates().(*tensors.Tensor)
-	encoderAttentionMask := batch.GetEncoderAttentionMask().(*tensors.Tensor)
+	// Get encoder outputs with nil checks
+	encoderHiddenStatesAny := batch.GetEncoderHiddenStates()
+	if encoderHiddenStatesAny == nil {
+		return errors.New("encoder hidden states not set - was Encode() called?")
+	}
+	encoderHiddenStates, ok := encoderHiddenStatesAny.(*tensors.Tensor)
+	if !ok {
+		return fmt.Errorf("encoder hidden states has unexpected type %T", encoderHiddenStatesAny)
+	}
+
+	encoderAttentionMaskAny := batch.GetEncoderAttentionMask()
+	if encoderAttentionMaskAny == nil {
+		return errors.New("encoder attention mask not set - was Encode() called?")
+	}
+	encoderAttentionMask, ok := encoderAttentionMaskAny.(*tensors.Tensor)
+	if !ok {
+		return fmt.Errorf("encoder attention mask has unexpected type %T", encoderAttentionMaskAny)
+	}
 
 	// Initialize decoder input with start token
 	currentIDs := make([]int64, batchSize)
@@ -141,8 +149,30 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 	var encoderPKV []*tensors.Tensor
 	var decoderPKV []*tensors.Tensor
 
+	// Set cleanup function BEFORE generation loop to ensure cleanup on any error path
+	// The cleanup function safely handles nil slices and nil tensors
+	batch.SetDestroyDecoder(func() error {
+		var errs []error
+		// Clean up encoder PKV (cross-attention, constant throughout generation)
+		for _, kv := range encoderPKV {
+			if kv != nil {
+				errs = append(errs, kv.FinalizeAll())
+			}
+		}
+		// Clean up decoder PKV (self-attention, updated each step)
+		for _, kv := range decoderPKV {
+			if kv != nil {
+				errs = append(errs, kv.FinalizeAll())
+			}
+		}
+		return errors.Join(errs...)
+	})
+
 	// Generation loop
+	var actualSteps int
 	for step := 0; step < maxNewTokens && finishedCount < batchSize; step++ {
+		actualSteps = step + 1 // Track how many steps we've completed
+
 		// Create input tensor for this step
 		inputTensor := tensors.FromFlatDataAndDimensions(currentIDs, batchSize, 1)
 
@@ -201,6 +231,10 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 				if err := outputs[i].ToLocal(); err != nil {
 					inputTensor.FinalizeAll()
 					logits.FinalizeAll()
+					// Clean up PKV tensors that were already converted successfully
+					for j := 1; j < i; j++ {
+						outputs[j].FinalizeAll()
+					}
 					return fmt.Errorf("moving KV cache tensor %d to local at step %d: %w", i-1, step, err)
 				}
 			}
@@ -259,32 +293,17 @@ func runSeq2SeqGenerationGoMLX(batch Seq2SeqBatchInterface, pipeline Seq2SeqPipe
 		logits.FinalizeAll()
 	}
 
+	batch.SetActualSteps(actualSteps)
 	batch.SetGeneratedTokens(generatedTokens)
 	batch.SetFinished(finished)
 	batch.SetFinishedCount(finishedCount)
 
-	// Set cleanup function for decoder resources
-	batch.SetDestroyDecoder(func() error {
-		var errs []error
-		// Clean up encoder PKV (cross-attention, constant throughout generation)
-		for _, kv := range encoderPKV {
-			if kv != nil {
-				errs = append(errs, kv.FinalizeAll())
-			}
-		}
-		// Clean up decoder PKV (self-attention, updated each step)
-		for _, kv := range decoderPKV {
-			if kv != nil {
-				errs = append(errs, kv.FinalizeAll())
-			}
-		}
-		return errors.Join(errs...)
-	})
-
+	// Cleanup function was already set before the loop to handle error paths
 	return nil
 }
 
 // argmaxFromLogitsGoMLX extracts the argmax token ID from logits for each batch item.
+// Uses shared ArgmaxBatch after extracting and reshaping tensor data.
 func argmaxFromLogitsGoMLX(logits *tensors.Tensor) ([]int64, error) {
 	shape := logits.Shape()
 	if shape.Rank() < 2 || shape.Rank() > 3 {
@@ -295,52 +314,23 @@ func argmaxFromLogitsGoMLX(logits *tensors.Tensor) ([]int64, error) {
 	vocabSize := shape.Dimensions[shape.Rank()-1]
 
 	// Extract logits as float32 slice
-	var logitsData []float32
-	switch shape.DType {
-	case dtypes.Float32:
-		logitsData = tensors.MustCopyFlatData[float32](logits)
-	case dtypes.Float64:
-		float64Data := tensors.MustCopyFlatData[float64](logits)
-		logitsData = make([]float32, len(float64Data))
-		for i, v := range float64Data {
-			logitsData[i] = float32(v)
-		}
-	default:
-		return nil, fmt.Errorf("unsupported dtype for logits: %s", shape.DType)
+	logitsData, err := extractLogitsFloat32(logits)
+	if err != nil {
+		return nil, err
 	}
 
-	// Find argmax for each batch item
-	tokens := make([]int64, batchSize)
-	for batch := 0; batch < batchSize; batch++ {
-		var offset int
-		if shape.Rank() == 3 {
-			seqLen := shape.Dimensions[1]
-			offset = batch*seqLen*vocabSize + (seqLen-1)*vocabSize
-		} else {
-			offset = batch * vocabSize
-		}
-
-		// Bounds check to prevent panic
-		if offset+vocabSize > len(logitsData) {
-			return nil, fmt.Errorf("logits buffer too small: need %d elements, have %d", offset+vocabSize, len(logitsData))
-		}
-
-		maxIdx := 0
-		maxVal := logitsData[offset]
-		for v := 1; v < vocabSize; v++ {
-			if logitsData[offset+v] > maxVal {
-				maxVal = logitsData[offset+v]
-				maxIdx = v
-			}
-		}
-		tokens[batch] = int64(maxIdx)
+	// For 3D tensors, extract only the last position
+	if shape.Rank() == 3 {
+		seqLen := shape.Dimensions[1]
+		logitsData = extractLastPosition(logitsData, batchSize, seqLen, vocabSize)
 	}
 
-	return tokens, nil
+	// Use shared argmax utility
+	return ArgmaxBatch(logitsData, batchSize, vocabSize)
 }
 
 // sampleFromLogitsGoMLX samples token IDs from logits with temperature and top-p.
-// Creates a thread-local RNG seeded with current time for non-deterministic sampling.
+// Uses shared SampleTopPBatch after extracting and reshaping tensor data.
 func sampleFromLogitsGoMLX(logits *tensors.Tensor, topP, temperature float32) ([]int64, error) {
 	shape := logits.Shape()
 	if shape.Rank() < 2 || shape.Rank() > 3 {
@@ -351,115 +341,50 @@ func sampleFromLogitsGoMLX(logits *tensors.Tensor, topP, temperature float32) ([
 	vocabSize := shape.Dimensions[shape.Rank()-1]
 
 	// Extract logits as float32 slice
-	var logitsData []float32
+	logitsData, err := extractLogitsFloat32(logits)
+	if err != nil {
+		return nil, err
+	}
+
+	// For 3D tensors, extract only the last position
+	if shape.Rank() == 3 {
+		seqLen := shape.Dimensions[1]
+		logitsData = extractLastPosition(logitsData, batchSize, seqLen, vocabSize)
+	}
+
+	// Use shared sampling utility with buffer pooling
+	rng := NewSamplingRNG()
+	return SampleTopPBatch(logitsData, batchSize, vocabSize, topP, temperature, rng)
+}
+
+// extractLogitsFloat32 extracts logits from a tensor as float32 slice.
+func extractLogitsFloat32(logits *tensors.Tensor) ([]float32, error) {
+	shape := logits.Shape()
 	switch shape.DType {
 	case dtypes.Float32:
-		logitsData = tensors.MustCopyFlatData[float32](logits)
+		return tensors.MustCopyFlatData[float32](logits), nil
 	case dtypes.Float64:
 		float64Data := tensors.MustCopyFlatData[float64](logits)
-		logitsData = make([]float32, len(float64Data))
+		result := make([]float32, len(float64Data))
 		for i, v := range float64Data {
-			logitsData[i] = float32(v)
+			result[i] = float32(v)
 		}
+		return result, nil
 	default:
 		return nil, fmt.Errorf("unsupported dtype for logits: %s", shape.DType)
 	}
-
-	// Create a thread-local RNG for this sampling operation
-	rng := rand.New(rand.NewSource(time.Now().UnixNano())) // #nosec G404 -- not used for crypto
-
-	tokens := make([]int64, batchSize)
-	for batch := 0; batch < batchSize; batch++ {
-		var offset int
-		if shape.Rank() == 3 {
-			seqLen := shape.Dimensions[1]
-			offset = batch*seqLen*vocabSize + (seqLen-1)*vocabSize
-		} else {
-			offset = batch * vocabSize
-		}
-
-		// Bounds check to prevent panic
-		if offset+vocabSize > len(logitsData) {
-			return nil, fmt.Errorf("logits buffer too small: need %d elements, have %d", offset+vocabSize, len(logitsData))
-		}
-
-		batchLogits := make([]float32, vocabSize)
-		copy(batchLogits, logitsData[offset:offset+vocabSize])
-
-		// Apply temperature
-		if temperature != 1.0 && temperature > 0 {
-			for i := range batchLogits {
-				batchLogits[i] /= temperature
-			}
-		}
-
-		// Convert to probabilities with softmax
-		probs := vectorutil.SoftMax(batchLogits)
-
-		// Apply top-p (nucleus) sampling with thread-safe RNG
-		tokens[batch] = int64(sampleTopPGoMLX(probs, topP, rng))
-	}
-
-	return tokens, nil
 }
 
-// sampleTopPGoMLX implements nucleus (top-p) sampling.
-// Uses the provided random source for thread-safe random number generation.
-func sampleTopPGoMLX(probs []float32, topP float32, rng *rand.Rand) int {
-	// Create indexed probabilities
-	type indexedProb struct {
-		index int
-		prob  float32
+// extractLastPosition extracts the last sequence position from 3D logits.
+// Input: [batch, seq, vocab] -> Output: [batch, vocab] (last position only)
+func extractLastPosition(logitsData []float32, batchSize, seqLen, vocabSize int) []float32 {
+	result := make([]float32, batchSize*vocabSize)
+	for b := 0; b < batchSize; b++ {
+		srcOffset := b*seqLen*vocabSize + (seqLen-1)*vocabSize
+		dstOffset := b * vocabSize
+		copy(result[dstOffset:dstOffset+vocabSize], logitsData[srcOffset:srcOffset+vocabSize])
 	}
-	indexed := make([]indexedProb, len(probs))
-	for i, p := range probs {
-		indexed[i] = indexedProb{i, p}
-	}
-
-	// Sort by probability descending using O(n log n) sort
-	sort.Slice(indexed, func(i, j int) bool {
-		return indexed[i].prob > indexed[j].prob
-	})
-
-	// Find the smallest set of tokens with cumulative probability >= topP
-	var cumSum float32
-	cutoff := 0
-	for i, ip := range indexed {
-		cumSum += ip.prob
-		if cumSum >= topP {
-			cutoff = i + 1
-			break
-		}
-	}
-	if cutoff == 0 {
-		cutoff = 1
-	}
-
-	// Normalize probabilities in the nucleus
-	nucleus := indexed[:cutoff]
-	var nucSum float32
-	for _, ip := range nucleus {
-		nucSum += ip.prob
-	}
-
-	// Random sampling from nucleus using thread-safe random source
-	r := rng.Float32() * nucSum
-	var cumProb float32
-	for _, ip := range nucleus {
-		cumProb += ip.prob
-		if r <= cumProb {
-			return ip.index
-		}
-	}
-
-	return nucleus[0].index
-}
-
-// NewSeq2SeqRNG creates a new random number generator for seq2seq sampling.
-// Each generation call should create its own RNG for thread safety.
-// Use a fixed seed for reproducible results, or use time-based seed for variety.
-func NewSeq2SeqRNG(seed int64) *rand.Rand {
-	return rand.New(rand.NewSource(seed)) // #nosec G404 -- not used for crypto
+	return result
 }
 
 // splitEncoderDecoderPKVGoMLX splits the PKV outputs from decoder-init into encoder and decoder PKV.
@@ -469,6 +394,11 @@ func NewSeq2SeqRNG(seed int64) *rand.Rand {
 // - encoderPKV contains cross-attention KV (constant throughout generation)
 // - decoderPKV contains self-attention KV (updated each step)
 func splitEncoderDecoderPKVGoMLX(allPKV []*tensors.Tensor, decoderInitModel *Model) (encoderPKV, decoderPKV []*tensors.Tensor) {
+	// Handle nil model gracefully
+	if decoderInitModel == nil || len(decoderInitModel.OutputsMeta) == 0 {
+		return nil, nil
+	}
+
 	// Analyze output names to determine which are encoder vs decoder PKV
 	// Output names from decoder-init are like: present.0.decoder.key, present.0.decoder.value,
 	// present.0.encoder.key, present.0.encoder.value, ...
@@ -492,6 +422,11 @@ func splitEncoderDecoderPKVGoMLX(allPKV []*tensors.Tensor, decoderInitModel *Mod
 // Decoder expects: past_key_values.0.decoder.key, past_key_values.0.decoder.value,
 // past_key_values.0.encoder.key, past_key_values.0.encoder.value, ...
 func combineEncoderDecoderPKVGoMLX(encoderPKV, decoderPKV []*tensors.Tensor, decoderModel *Model) []*tensors.Tensor {
+	// Handle nil model gracefully
+	if decoderModel == nil || len(decoderModel.InputsMeta) < 2 {
+		return nil
+	}
+
 	// Number of PKV inputs = total inputs - 2 (encoder_attention_mask, input_ids)
 	numPKVInputs := len(decoderModel.InputsMeta) - 2
 	result := make([]*tensors.Tensor, numPKVInputs)

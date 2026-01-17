@@ -108,14 +108,14 @@ func (o *Seq2SeqOutput) GetOutput() []any {
 // Seq2SeqBatch holds the intermediate state during seq2seq generation.
 type Seq2SeqBatch struct {
 	// Input
-	Inputs            []string
-	InputTokenIDs     [][]int64
+	Inputs             []string
+	InputTokenIDs      [][]int64
 	InputAttentionMask [][]int64
-	Size              int
-	MaxInputLength    int
+	Size               int
+	MaxInputLength     int
 
 	// Encoder output (cached for decoder)
-	EncoderHiddenStates any // Backend-specific tensor
+	EncoderHiddenStates  any // Backend-specific tensor
 	EncoderAttentionMask any
 
 	// Decoder state
@@ -127,6 +127,7 @@ type Seq2SeqBatch struct {
 	GeneratedTokens [][]int64
 	Finished        []bool
 	FinishedCount   int
+	ActualSteps     int // Actual number of decoder steps completed
 
 	// Cleanup functions
 	DestroyEncoder func() error
@@ -194,6 +195,9 @@ func WithSampling(topP, temperature float32) backends.PipelineOption[*Seq2SeqPip
 
 // WithRepetitionPenalty sets the repetition penalty for generation.
 // Values > 1.0 penalize repetition, 1.0 = no penalty.
+// NOTE: This parameter is currently not implemented in the generation loop.
+// It is accepted for API compatibility but has no effect.
+// TODO: Implement repetition penalty in the generation loop.
 func WithRepetitionPenalty(penalty float32) backends.PipelineOption[*Seq2SeqPipeline] {
 	return func(p *Seq2SeqPipeline) error {
 		if penalty <= 0 {
@@ -246,8 +250,31 @@ func NewSeq2SeqPipeline(
 }
 
 // loadModels loads the encoder, decoder-init, and decoder ONNX models.
-func (p *Seq2SeqPipeline) loadModels(modelPath string, opts *options.Options) error {
-	var err error
+// Uses deferred cleanup to prevent resource leaks if loading fails partway through.
+func (p *Seq2SeqPipeline) loadModels(modelPath string, opts *options.Options) (err error) {
+	// Track whether we succeeded - if not, cleanup partially loaded models
+	var loadSucceeded bool
+	defer func() {
+		if !loadSucceeded {
+			// Cleanup any models that were loaded before the failure
+			if p.EncoderModel != nil && p.EncoderModel.Destroy != nil {
+				p.EncoderModel.Destroy()
+				p.EncoderModel = nil
+			}
+			if p.DecoderInitModel != nil && p.DecoderInitModel.Destroy != nil {
+				p.DecoderInitModel.Destroy()
+				p.DecoderInitModel = nil
+			}
+			if p.DecoderModel != nil && p.DecoderModel.Destroy != nil {
+				p.DecoderModel.Destroy()
+				p.DecoderModel = nil
+			}
+			if p.Tokenizer != nil {
+				p.Tokenizer.Destroy()
+				p.Tokenizer = nil
+			}
+		}
+	}()
 
 	// Load encoder
 	p.EncoderModel, err = backends.LoadSeq2SeqEncoder(modelPath, opts)
@@ -278,6 +305,7 @@ func (p *Seq2SeqPipeline) loadModels(modelPath string, opts *options.Options) er
 		return fmt.Errorf("loading config: %w", err)
 	}
 
+	loadSucceeded = true
 	return nil
 }
 
@@ -340,18 +368,23 @@ func (p *Seq2SeqPipeline) GetMetadata() backends.PipelineMetadata {
 }
 
 // GetStatistics returns runtime statistics for the pipeline.
+// Uses atomic loads to safely read values that may be updated concurrently.
 func (p *Seq2SeqPipeline) GetStatistics() backends.PipelineStatistics {
 	stats := backends.PipelineStatistics{}
 
-	// Tokenizer stats
-	stats.TokenizerTotalTime = safeconv.U64ToDuration(p.PipelineTimings.TokenizerTotalNS)
-	stats.TokenizerExecutionCount = p.PipelineTimings.TokenizerNumCalls
+	// Tokenizer stats - use atomic loads for thread safety
+	tokenizerNS := atomic.LoadUint64(&p.PipelineTimings.TokenizerTotalNS)
+	tokenizerCalls := atomic.LoadUint64(&p.PipelineTimings.TokenizerNumCalls)
+	stats.TokenizerTotalTime = safeconv.U64ToDuration(tokenizerNS)
+	stats.TokenizerExecutionCount = tokenizerCalls
 
-	// Combined ONNX stats (encoder + decoder)
-	totalOnnxNS := p.PipelineTimings.EncoderTotalNS + p.PipelineTimings.DecoderTotalNS
-	totalOnnxCalls := p.PipelineTimings.EncoderNumCalls + p.PipelineTimings.DecoderNumCalls
-	stats.OnnxTotalTime = safeconv.U64ToDuration(totalOnnxNS)
-	stats.OnnxExecutionCount = totalOnnxCalls
+	// Combined ONNX stats (encoder + decoder) - use atomic loads
+	encoderNS := atomic.LoadUint64(&p.PipelineTimings.EncoderTotalNS)
+	decoderNS := atomic.LoadUint64(&p.PipelineTimings.DecoderTotalNS)
+	encoderCalls := atomic.LoadUint64(&p.PipelineTimings.EncoderNumCalls)
+	decoderCalls := atomic.LoadUint64(&p.PipelineTimings.DecoderNumCalls)
+	stats.OnnxTotalTime = safeconv.U64ToDuration(encoderNS + decoderNS)
+	stats.OnnxExecutionCount = encoderCalls + decoderCalls
 
 	return stats
 }
@@ -441,7 +474,13 @@ func (p *Seq2SeqPipeline) Generate(batch *Seq2SeqBatch) error {
 		err = backends.RunSeq2SeqGenerationGreedy(batch, p)
 	}
 
-	atomic.AddUint64(&p.PipelineTimings.DecoderNumCalls, uint64(p.MaxNewTokens))
+	// Use actual steps completed for accurate statistics
+	actualSteps := batch.ActualSteps
+	if actualSteps == 0 {
+		// Fallback for backwards compatibility if backend didn't set it
+		actualSteps = p.MaxNewTokens
+	}
+	atomic.AddUint64(&p.PipelineTimings.DecoderNumCalls, uint64(actualSteps))
 	atomic.AddUint64(&p.PipelineTimings.DecoderTotalNS, safeconv.DurationToU64(time.Since(start)))
 
 	return err
@@ -533,26 +572,28 @@ func (p *Seq2SeqPipeline) GetVocabSize() int                    { return p.Vocab
 
 // Interface implementations for backends.Seq2SeqBatchInterface
 
-func (b *Seq2SeqBatch) GetSize() int                       { return b.Size }
-func (b *Seq2SeqBatch) GetInputTokenIDs() [][]int64        { return b.InputTokenIDs }
-func (b *Seq2SeqBatch) GetInputAttentionMask() [][]int64   { return b.InputAttentionMask }
-func (b *Seq2SeqBatch) GetMaxInputLength() int             { return b.MaxInputLength }
-func (b *Seq2SeqBatch) SetEncoderHiddenStates(states any)  { b.EncoderHiddenStates = states }
-func (b *Seq2SeqBatch) GetEncoderHiddenStates() any        { return b.EncoderHiddenStates }
-func (b *Seq2SeqBatch) SetEncoderAttentionMask(mask any)   { b.EncoderAttentionMask = mask }
-func (b *Seq2SeqBatch) GetEncoderAttentionMask() any       { return b.EncoderAttentionMask }
-func (b *Seq2SeqBatch) SetPastKeyValues(pkv []any)         { b.PastKeyValues = pkv }
-func (b *Seq2SeqBatch) GetPastKeyValues() []any            { return b.PastKeyValues }
-func (b *Seq2SeqBatch) SetLogits(logits any)               { b.Logits = logits }
-func (b *Seq2SeqBatch) GetLogits() any                     { return b.Logits }
-func (b *Seq2SeqBatch) GetGeneratedTokens() [][]int64      { return b.GeneratedTokens }
+func (b *Seq2SeqBatch) GetSize() int                        { return b.Size }
+func (b *Seq2SeqBatch) GetInputTokenIDs() [][]int64         { return b.InputTokenIDs }
+func (b *Seq2SeqBatch) GetInputAttentionMask() [][]int64    { return b.InputAttentionMask }
+func (b *Seq2SeqBatch) GetMaxInputLength() int              { return b.MaxInputLength }
+func (b *Seq2SeqBatch) SetEncoderHiddenStates(states any)   { b.EncoderHiddenStates = states }
+func (b *Seq2SeqBatch) GetEncoderHiddenStates() any         { return b.EncoderHiddenStates }
+func (b *Seq2SeqBatch) SetEncoderAttentionMask(mask any)    { b.EncoderAttentionMask = mask }
+func (b *Seq2SeqBatch) GetEncoderAttentionMask() any        { return b.EncoderAttentionMask }
+func (b *Seq2SeqBatch) SetPastKeyValues(pkv []any)          { b.PastKeyValues = pkv }
+func (b *Seq2SeqBatch) GetPastKeyValues() []any             { return b.PastKeyValues }
+func (b *Seq2SeqBatch) SetLogits(logits any)                { b.Logits = logits }
+func (b *Seq2SeqBatch) GetLogits() any                      { return b.Logits }
+func (b *Seq2SeqBatch) GetGeneratedTokens() [][]int64       { return b.GeneratedTokens }
 func (b *Seq2SeqBatch) SetGeneratedTokens(tokens [][]int64) { b.GeneratedTokens = tokens }
-func (b *Seq2SeqBatch) GetFinished() []bool                { return b.Finished }
-func (b *Seq2SeqBatch) SetFinished(finished []bool)        { b.Finished = finished }
-func (b *Seq2SeqBatch) GetFinishedCount() int              { return b.FinishedCount }
-func (b *Seq2SeqBatch) SetFinishedCount(count int)         { b.FinishedCount = count }
-func (b *Seq2SeqBatch) SetDestroyEncoder(fn func() error)  { b.DestroyEncoder = fn }
-func (b *Seq2SeqBatch) SetDestroyDecoder(fn func() error)  { b.DestroyDecoder = fn }
+func (b *Seq2SeqBatch) GetFinished() []bool                 { return b.Finished }
+func (b *Seq2SeqBatch) SetFinished(finished []bool)         { b.Finished = finished }
+func (b *Seq2SeqBatch) GetFinishedCount() int               { return b.FinishedCount }
+func (b *Seq2SeqBatch) SetFinishedCount(count int)          { b.FinishedCount = count }
+func (b *Seq2SeqBatch) GetActualSteps() int                 { return b.ActualSteps }
+func (b *Seq2SeqBatch) SetActualSteps(steps int)            { b.ActualSteps = steps }
+func (b *Seq2SeqBatch) SetDestroyEncoder(fn func() error)   { b.DestroyEncoder = fn }
+func (b *Seq2SeqBatch) SetDestroyDecoder(fn func() error)   { b.DestroyDecoder = fn }
 
 // Helper functions for different seq2seq model input formats
 

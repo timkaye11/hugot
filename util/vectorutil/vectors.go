@@ -3,7 +3,6 @@ package vectorutil
 import (
 	"fmt"
 	"math"
-	"slices"
 )
 
 // Mean of a float32 vector.
@@ -19,17 +18,40 @@ func Mean(vector []float32) float32 {
 
 // SoftMax take a vector and calculate softmax scores of its values.
 func SoftMax(vector []float32) []float32 {
-	maxLogit := slices.Max(vector)
-	shiftedExp := make([]float64, len(vector))
-	for i, logit := range vector {
-		shiftedExp[i] = math.Exp(float64(logit - maxLogit))
-	}
-	sumExp := SumSlice(shiftedExp)
 	scores := make([]float32, len(vector))
-	for i, exp := range shiftedExp {
-		scores[i] = float32(exp / sumExp)
-	}
+	SoftMaxInto(vector, scores)
 	return scores
+}
+
+// SoftMaxInto calculates softmax scores and writes them to the output buffer.
+// This avoids allocation when the caller can provide a reusable buffer.
+// The output slice must have the same length as the input.
+func SoftMaxInto(vector []float32, output []float32) {
+	if len(vector) == 0 {
+		return
+	}
+
+	// Find max for numerical stability
+	maxLogit := vector[0]
+	for _, v := range vector[1:] {
+		if v > maxLogit {
+			maxLogit = v
+		}
+	}
+
+	// Compute exp and sum in one pass
+	sumExp := float64(0)
+	for i, logit := range vector {
+		exp := math.Exp(float64(logit - maxLogit))
+		output[i] = float32(exp)
+		sumExp += exp
+	}
+
+	// Normalize
+	invSum := float32(1.0 / sumExp)
+	for i := range output {
+		output[i] *= invSum
+	}
 }
 
 func SumSlice(s []float64) float64 {

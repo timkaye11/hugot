@@ -51,6 +51,8 @@ type Seq2SeqBatchInterface interface {
 	SetFinished(finished []bool)
 	GetFinishedCount() int
 	SetFinishedCount(count int)
+	GetActualSteps() int
+	SetActualSteps(steps int)
 	SetDestroyEncoder(fn func() error)
 	SetDestroyDecoder(fn func() error)
 }
@@ -74,14 +76,9 @@ type Seq2SeqTokenized struct {
 	MaxLength     int
 }
 
-// LoadSeq2SeqEncoder loads the encoder model for seq2seq inference.
-// Looks for encoder.onnx or *-encoder*.onnx in the model path.
-func LoadSeq2SeqEncoder(modelPath string, opts *options.Options) (*Model, error) {
-	onnxFile, err := findOnnxFile(modelPath, "encoder")
-	if err != nil {
-		return nil, err
-	}
-
+// loadSeq2SeqModel is the shared model loading logic for seq2seq models.
+// This reduces duplication across encoder, decoder-init, and decoder loading.
+func loadSeq2SeqModel(modelPath, onnxFile string, opts *options.Options) (*Model, error) {
 	model := &Model{
 		Path:         modelPath,
 		OnnxFilename: onnxFile,
@@ -111,6 +108,16 @@ func LoadSeq2SeqEncoder(modelPath string, opts *options.Options) (*Model, error)
 	}
 
 	return model, nil
+}
+
+// LoadSeq2SeqEncoder loads the encoder model for seq2seq inference.
+// Looks for encoder.onnx or *-encoder*.onnx in the model path.
+func LoadSeq2SeqEncoder(modelPath string, opts *options.Options) (*Model, error) {
+	onnxFile, err := findOnnxFile(modelPath, "encoder")
+	if err != nil {
+		return nil, err
+	}
+	return loadSeq2SeqModel(modelPath, onnxFile, opts)
 }
 
 // LoadSeq2SeqDecoderInit loads the initial decoder model (no past_key_values).
@@ -120,36 +127,7 @@ func LoadSeq2SeqDecoderInit(modelPath string, opts *options.Options) (*Model, er
 	if err != nil {
 		return nil, err
 	}
-
-	model := &Model{
-		Path:         modelPath,
-		OnnxFilename: onnxFile,
-		Pipelines:    make(map[string]Pipeline),
-	}
-
-	if err := LoadOnnxModelBytes(model); err != nil {
-		return nil, err
-	}
-
-	if err := CreateModelBackend(model, opts); err != nil {
-		return nil, err
-	}
-
-	model.Destroy = func() error {
-		switch opts.Backend {
-		case "ORT":
-			if model.ORTModel != nil {
-				return model.ORTModel.Destroy()
-			}
-		case "GO", "XLA":
-			if model.GoMLXModel != nil {
-				model.GoMLXModel.Destroy()
-			}
-		}
-		return nil
-	}
-
-	return model, nil
+	return loadSeq2SeqModel(modelPath, onnxFile, opts)
 }
 
 // LoadSeq2SeqDecoder loads the decoder model with past_key_values support.
@@ -159,36 +137,7 @@ func LoadSeq2SeqDecoder(modelPath string, opts *options.Options) (*Model, error)
 	if err != nil {
 		return nil, err
 	}
-
-	model := &Model{
-		Path:         modelPath,
-		OnnxFilename: onnxFile,
-		Pipelines:    make(map[string]Pipeline),
-	}
-
-	if err := LoadOnnxModelBytes(model); err != nil {
-		return nil, err
-	}
-
-	if err := CreateModelBackend(model, opts); err != nil {
-		return nil, err
-	}
-
-	model.Destroy = func() error {
-		switch opts.Backend {
-		case "ORT":
-			if model.ORTModel != nil {
-				return model.ORTModel.Destroy()
-			}
-		case "GO", "XLA":
-			if model.GoMLXModel != nil {
-				model.GoMLXModel.Destroy()
-			}
-		}
-		return nil
-	}
-
-	return model, nil
+	return loadSeq2SeqModel(modelPath, onnxFile, opts)
 }
 
 // LoadSeq2SeqTokenizer loads the tokenizer for seq2seq models.
@@ -381,4 +330,72 @@ func findDecoderOnnxFile(modelPath string) (string, error) {
 	}
 
 	return "", fmt.Errorf("no decoder ONNX file found in %s", modelPath)
+}
+
+// PKVSplitResult contains the indices for splitting PKV tensors into encoder and decoder parts.
+type PKVSplitResult struct {
+	EncoderIndices []int // Indices (in allPKV slice) that are encoder PKV
+	DecoderIndices []int // Indices (in allPKV slice) that are decoder PKV
+}
+
+// AnalyzePKVSplit determines which PKV outputs are encoder (cross-attention) vs decoder (self-attention).
+// This is used by both ORT and GoMLX backends to split decoder-init PKV outputs.
+// The outputsMeta should be from the decoder-init model, and numPKV is the count of PKV tensors
+// (excluding logits at index 0).
+func AnalyzePKVSplit(outputsMeta []InputOutputInfo, numPKV int) PKVSplitResult {
+	result := PKVSplitResult{}
+
+	for i := 0; i < numPKV; i++ {
+		// Output index in model is i+1 (since logits is at index 0)
+		outputIdx := i + 1
+		if outputIdx >= len(outputsMeta) {
+			continue
+		}
+
+		outputName := outputsMeta[outputIdx].Name
+		if strings.Contains(outputName, ".encoder.") {
+			result.EncoderIndices = append(result.EncoderIndices, i)
+		} else {
+			result.DecoderIndices = append(result.DecoderIndices, i)
+		}
+	}
+
+	return result
+}
+
+// PKVCombineMapping describes how to combine encoder and decoder PKV for decoder input.
+type PKVCombineMapping struct {
+	IsEncoder   bool // True if this position should use encoder PKV, false for decoder PKV
+	SourceIndex int  // Index into encoder or decoder PKV slice
+}
+
+// AnalyzePKVCombine determines the order for combining encoder and decoder PKV for decoder input.
+// This is used by both ORT and GoMLX backends to prepare PKV inputs for the decoder model.
+// The inputsMeta should be from the decoder model.
+func AnalyzePKVCombine(inputsMeta []InputOutputInfo) []PKVCombineMapping {
+	if len(inputsMeta) < 2 {
+		return nil
+	}
+
+	// PKV inputs start at index 2 (after encoder_attention_mask and input_ids)
+	numPKVInputs := len(inputsMeta) - 2
+	mapping := make([]PKVCombineMapping, numPKVInputs)
+
+	encIdx := 0
+	decIdx := 0
+
+	for i := 2; i < len(inputsMeta); i++ {
+		inputName := inputsMeta[i].Name
+		resultIdx := i - 2
+
+		if strings.Contains(inputName, ".encoder.") {
+			mapping[resultIdx] = PKVCombineMapping{IsEncoder: true, SourceIndex: encIdx}
+			encIdx++
+		} else {
+			mapping[resultIdx] = PKVCombineMapping{IsEncoder: false, SourceIndex: decIdx}
+			decIdx++
+		}
+	}
+
+	return mapping
 }
